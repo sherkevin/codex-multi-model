@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 备份与日志（写入前自动备份产生的）
+*.bak-*
+*.log
+
+# 本地真实配置/密钥（绝不入库；这些通常也在 ~/.codex 下，此处双重防护）
+router-routes.json
+router-secrets.env
+auth.json
+config.toml
+custom-model-catalog.json
+
+# macOS
+.DS_Store

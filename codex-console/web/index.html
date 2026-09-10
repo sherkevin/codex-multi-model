@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Codex 配置台</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo">◧</span><span class="title">Codex 配置台</span></div>
+  <div class="live">
+    <span class="pill"><i id="dotLogin" class="dot"></i><span id="txtLogin">登录态…</span></span>
+    <span class="pill"><i id="dotRouter" class="dot"></i><span id="txtRouter">中转…</span></span>
+  </div>
+  <button id="refresh" class="btn ghost" title="实时重读 Codex 当前配置">↻ 刷新</button>
+</header>
+
+<section class="status-strip">
+  <div class="stat"><div class="k">Codex 登录</div><div class="v" id="stLogin">—</div></div>
+  <div class="stat"><div class="k">后端模式</div><div class="v" id="stBackend">—</div></div>
+  <div class="stat"><div class="k">model_provider</div><div class="v" id="stProvider">—</div></div>
+  <div class="stat"><div class="k">默认模型</div><div class="v" id="stModel">—</div></div>
+  <div class="stat"><div class="k">思考档</div><div class="v" id="stEffort">—</div></div>
+  <div class="stat"><div class="k">模型数</div><div class="v" id="stCatalog">—</div></div>
+</section>
+<p class="consistency">↑ 实时取自 Codex 本体（<code>codex login status</code> + config.toml + 中转 <code>/v1/routes</code>），非网页缓存。下面改的就是这些文件，两边永远一致。</p>
+
+<main>
+  <!-- 后端模式 / 中转 -->
+  <details class="card" open>
+    <summary>后端模式 & 中转（model → 真实 provider，透明路由）</summary>
+    <div id="backendBox" class="backend-box"></div>
+    <p class="hint">下表是中转 <b>此刻真实生效</b> 的路由（取自 <code>/v1/routes</code>）。Codex 的 <code>model_provider</code> 是单值：跨 provider 或含 translate 模型时必须经中转统一分发；只有「全部模型同一 provider 且都 passthrough」才能直连、不经中转。</p>
+    <table class="routes" id="routesTable"></table>
+    <div class="row">
+      <button id="applyBackend" class="btn">应用推荐后端到 config.toml</button>
+      <button id="restartRouter" class="btn">⟳ 重启中转</button>
+      <span id="backendMsg" class="msg"></span>
+    </div>
+  </details>
+
+  <!-- ① Providers -->
+  <details class="card" open>
+    <summary>① Provider（真实上游：base_url · AK 变量）</summary>
+    <p class="hint">每个 provider = 一个真实上游。AK 只填<b>变量名</b>（值在「密钥」卡写，绝不进配置文件）。</p>
+    <div id="providers" class="stack"></div>
+    <div class="row"><button id="addProvider" class="btn">＋ 新增 provider</button>
+      <button id="saveRoutes" class="btn primary">保存 Provider + Model 路由</button><span id="provMsg" class="msg"></span></div>
+  </details>
+
+  <!-- ② Models -->
+  <details class="card" open>
+    <summary>② Model（显示名 · 描述 · 可见性 · 默认档 · 走哪个 provider）</summary>
+    <p class="hint">每个模型选它的 <b>provider</b>（用哪家的额度）与 <b>模式</b>：passthrough=上游原生 Responses；translate=上游只有 chat、需中转翻译。显示名/描述/可见性/默认档写进模型目录（改后需重启桌面 App）。</p>
+    <div id="models" class="stack"></div>
+    <div class="row"><button id="addModel" class="btn">＋ 新增 model</button><span id="modelMsg" class="msg"></span></div>
+  </details>
+
+  <!-- 默认模型 & 思考档 -->
+  <details class="card">
+    <summary>默认模型与思考档（config.toml 顶层）</summary>
+    <div class="grid2">
+      <div class="field"><label>默认模型 model（新会话生效）</label><select id="cfg_model" class="sel full"></select></div>
+      <div class="field"><label>默认思考档 model_reasoning_effort</label><input id="cfg_effort" class="inp mono"></div>
+      <div class="field"><label>评审模型 review_model</label><input id="cfg_review" class="inp mono"></div>
+      <div class="field"><label>model_provider（一般勿手改，由后端模式决定）</label><input id="cfg_provider" class="inp mono"></div>
+    </div>
+    <div class="row"><button id="saveTop" class="btn primary">保存</button><span id="topMsg" class="msg"></span></div>
+  </details>
+
+  <!-- 密钥 -->
+  <details class="card">
+    <summary>密钥 AK（上游真实 Key）</summary>
+    <p class="hint">写入 <code>~/.codex/router-secrets.env</code>（权限 600），<b>绝不进 config.toml、绝不回显明文</b>。改完需重启中转生效。</p>
+    <div id="secrets" class="stack"></div>
+  </details>
+
+  <!-- 登录绕过 -->
+  <details class="card">
+    <summary>绕过账号登录（auth.json = apikey 模式）</summary>
+    <p class="hint">Codex 登录门只校验 auth.json 处于 apikey 模式且有任意非空 key；占位串即可过门，真实鉴权由中转各 AK 完成。被 <code>codex logout</code> 或升级重置后点修复。</p>
+    <div class="row"><span id="authMsg" class="msg"></span><button id="fixAuth" class="btn">修复登录绕过</button></div>
+  </details>
+</main>
+
+<footer class="restart-bar">
+  <button id="restartDesktop" class="btn danger big">⟳ 一键重启 Codex 桌面 App</button>
+  <span id="restartMsg" class="msg"></span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
