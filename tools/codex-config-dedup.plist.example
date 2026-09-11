@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  可选：把 codex-config-dedup 装成 launchd 守护，在 config.toml 变动时自动自愈重复键。
+  用法：把下面三处占位符替换成你的实际值，另存为
+        ~/Library/LaunchAgents/com.<你的标识>.codex-config-dedup.plist
+  然后：launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.<你的标识>.codex-config-dedup.plist
+
+    <PYTHON>      → python3 绝对路径（which python3，需能 import tomlkit 或用 3.11+ 的 tomllib）
+    <SCRIPT>      → codex-config-dedup.py 绝对路径
+    <CODEX_HOME>  → 你的 ~/.codex/config.toml 绝对路径
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.YOURNAME.codex-config-dedup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>&lt;PYTHON&gt;</string>
+    <string>&lt;SCRIPT&gt;</string>
+  </array>
+  <key>WatchPaths</key>
+  <array>
+    <string>&lt;CODEX_HOME&gt;/config.toml</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>120</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/codex-config-dedup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/codex-config-dedup.log</string>
+</dict>
+</plist>
