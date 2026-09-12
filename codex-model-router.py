@@ -148,6 +148,29 @@ def map_usage(u):
 
 # ─────────────────────────── Responses -> Chat ───────────────────────────
 
+def _ensure_json_args(args):
+    """保证 tool_call 的 function.arguments 是合法 JSON 字符串，非法则退回 "{}"。
+
+    很多 chat 网关（如 qwen 系）会校验请求历史里**每个** tool_call 的 arguments 必须
+    是合法 JSON，否则整条请求 400（典型报错 `function.arguments ... must be in JSON
+    format`）。当模型把超大内容（如一次性 `cat > file <<'EOF' …` 的 heredoc）塞进单个
+    工具调用时，输出可能撞到上游生成上限被截断，arguments 变成未闭合的 JSON；客户端
+    解析失败后仍把这条坏 args 存进历史，于是之后**每个**请求都被它拖垮、整条会话卡死。
+
+    这里在把 Responses 历史翻译成 chat 请求时兜底：非法 JSON 一律置为 "{}"。那条调用
+    本就失败、其输出已记为解析错误，置空不改变语义，模型照常自行重试；但请求重新合法、
+    会话不再卡死。
+    """
+    if not isinstance(args, str) or not args.strip():
+        return "{}"
+    try:
+        json.loads(args)
+        return args
+    except Exception:
+        log("   [warn] tool_call arguments 非法 JSON（疑似上游截断），回传历史时置为 {}")
+        return "{}"
+
+
 def repair_tool_pairs(msgs):
     """保证 chat 协议不变式：带 tool_calls 的 assistant 消息后面必须紧跟每个
     tool_call_id 对应的 tool 消息。
@@ -207,7 +230,7 @@ def resp_req_to_chat(body):
                 "id": item.get("call_id") or item.get("id") or new_id("call"),
                 "type": "function",
                 "function": {"name": item.get("name", ""),
-                             "arguments": item.get("arguments", "") or "{}"},
+                             "arguments": _ensure_json_args(item.get("arguments", ""))},
             }
             # 并行工具调用在 Responses 里是连续多个 function_call item。chat 协议要求
             # 一条 assistant 消息带上全部 tool_calls，紧跟着才是各自的 tool 回复；
@@ -264,6 +287,7 @@ class ResponsesEmitter:
         self.resp_id = new_id("resp")
         self.output = []          # 累积最终 output 数组
         self.open_kind = None     # None | reasoning | message | function_call
+        self.finish_reason = None  # 上游最后一个 finish_reason（length 表示被截断）
         self.item_id = None
         self.buf = ""             # 当前 item 累积文本
         self.fc = None            # 当前 function_call 状态
@@ -364,6 +388,13 @@ class ResponsesEmitter:
                                  "text": self.buf}]}
         else:
             args = self.fc["args"] or "{}"
+            if args.strip():
+                try:
+                    json.loads(args)
+                except Exception:
+                    log(f"   [warn] 上游 tool_call '{self.fc['name']}' arguments 截断/非法 JSON"
+                        f"（finish_reason={self.finish_reason}，len={len(args)}）；原样下发，"
+                        f"回传历史时会由 _ensure_json_args 兜底")
             self.emit("response.function_call_arguments.done", {
                 "name": self.fc["name"], "arguments": args,
                 "output_index": self.output_index, "item_id": iid})
@@ -429,6 +460,9 @@ def translate_stream(up, wfile, req_body):
             if o.get("usage"):
                 usage = o["usage"]
             for ch in o.get("choices") or []:
+                fr = ch.get("finish_reason")
+                if fr:
+                    em.finish_reason = fr
                 d = ch.get("delta") or {}
                 if d.get("reasoning_content"):
                     em.reasoning_delta(d["reasoning_content"])
