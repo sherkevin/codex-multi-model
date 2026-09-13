@@ -4,6 +4,10 @@
 - 日期：2026-09-13
 - 相关文件：`codex-model-router.py`
 - 关联：[0001](0001-router-mode-criterion.md)（为什么必须走 chat 桥）
+- 部分更正：[0009](0009-upstream-byte-limit-is-escaped-and-undersold.md) ——
+  本文「字节上限 6291456」与「`ensure_ascii=False` 是最便宜的一击」两处结论不准：
+  真实硬顶是 4,718,592 B，且上游按 **ASCII 转义后**字节计量，所以发送端改成 UTF-8
+  只省带宽、不省额度。两类超限分开处理的决策本身不变。
 
 ## 背景
 

@@ -88,6 +88,7 @@ freeform 的 `apply_patch`。
 | **配置去重工具** | `tools/codex-config-dedup.py` | 自愈 `config.toml` 的「重复键」解析错误（见下文） |
 | **服务模板** | `service/` | launchd（macOS）/ systemd（Linux）/ 计划任务（Windows）三套常驻模板 |
 | **Responses 探针** | `probe-responses-support.py` | 实测判定每个模型该走 passthrough 还是 translate（见 ADR 0001） |
+| **字节硬顶探针** | `probe-body-byte-limit.py` | 实测上游真实的请求体字节上限**与计量口径**（见 ADR 0009） |
 | **接入手册（中文）** | `多模型接入手册.md` | 原理、分步实施、协议不变式、排错 |
 
 ---
@@ -189,6 +190,18 @@ Codex 的登录门槛只检查 `~/.codex/auth.json` 处于 `apikey` 模式且密
 
 ---
 
+## 测试
+
+```bash
+python3 tests/test_body_byte_limit.py
+```
+
+纯 stdlib、不联网、不消耗上游额度：它会起一个按真实方式限额（按转义字节计量）的
+模拟上游，再拉起一个真路由进程打上去。覆盖 ADR 0009 记录的两个字节护栏 bug ——
+计量口径，以及那个会把自己卸载结果丢掉的循环。改动字节护栏后请重跑。
+
+---
+
 ## 安全
 
 - **密钥永不落配置文件**：真实 AK 只在环境变量 / `~/.codex/router-secrets.env`（chmod 600）；`config.toml` 只存变量*名*。配置台界面只显示掩码，绝不回显明文。
@@ -210,6 +223,7 @@ Codex 的登录门槛只检查 `~/.codex/auth.json` 处于 `apikey` 模式且密
 ├── codex-model-router.py      ← 中转（核心）
 ├── regen-model-catalog.py     ← 模型目录生成器
 ├── probe-responses-support.py ← passthrough/translate 探针（四级递进，见 ADR 0001）
+├── probe-body-byte-limit.py   ← 上游字节硬顶 + 计量口径探针（见 ADR 0009）
 ├── 多模型接入手册.md            ← 接入手册（中文）
 ├── run-router.bat             ← Windows 前台启动脚本
 ├── service/                   ← 常驻模板（macOS / Linux / Windows）
@@ -217,6 +231,8 @@ Codex 的登录门槛只检查 `~/.codex/auth.json` 处于 `apikey` 模式且密
 │   ├── codex-model-router.service.example
 │   └── install-windows-service.ps1
 ├── docs/adr/                  ← 架构决议记录（"为什么这么做"）
+├── tests/
+│   └── test_body_byte_limit.py ← 字节护栏的回归测试（纯 stdlib，不打真实上游）
 ├── tools/
 │   ├── codex-config-dedup.py          ← config.toml 重复键自愈器
 │   ├── codex-config-dedup.plist.example
@@ -237,12 +253,26 @@ Codex 的登录门槛只检查 `~/.codex/auth.json` 处于 `apikey` 模式且密
 
 | 字段 | 含义 | 默认 |
 |---|---|---|
-| `body_byte_limit` | 上游请求体字节硬顶 | `6291456` |
+| `body_byte_limit` | 上游请求体字节硬顶，**按上游的计量口径**（见下） | `4718592` |
 | `input_token_limit` | 上游输入 token 硬顶 | `0`（不设） |
 
 只要你的网关有 token 硬顶，就把 `input_token_limit` 填上。它决定压缩请求能有多大
 （从而保证压缩一定压得下去），也让中转能区分「真超限」与「上游瞬时抖动」。
 两个字段也可以写在 provider 上，对该 provider 下所有模型生效。
+
+> **`body_byte_limit` 要实测，别抄错误消息里的数字。** 这里有两个坑，都是踩出来的
+> （见 [ADR 0009](docs/adr/0009-upstream-byte-limit-is-escaped-and-undersold.md)）：
+>
+> 1. `Exceeded limit on max bytes to request body : 6291456` 里那个数**不是**真正拒绝你
+>    的阈值。在同一个网关上实测，真实上限是 `4,718,592` B（4.5 MiB），低 25%。
+>    宣称的那个属于外层网关，真正卡住请求的是模型层。
+> 2. 上游量的是 **ASCII 转义后**的字节，不是我们发出的 UTF-8 字节。一个中文字符
+>    UTF-8 占 3 B，转义成 `\uXXXX` 占 6 B。用不同中英比例的填充做二分：可发送字节的
+>    阈值在纯中文时正好掉到一半，而换算成转义字节后五个点全落在同一常数的 ±1.7% 内。
+>
+> 中转按转义口径算预算，与上游对齐。发送端仍用 `ensure_ascii=False`，那能省一半带宽，
+> 但**换不回**任何字节额度。用 `probe-body-byte-limit.py` 实测你自己的网关，它会同时
+> 判定口径与阈值，并直接给出可抄进配置的 `body_byte_limit`。
 
 **环境变量**（全部可选）：
 
@@ -254,7 +284,10 @@ Codex 的登录门槛只检查 `~/.codex/auth.json` 处于 `apikey` 模式且密
 | `ROUTER_NATIVE_HINT` | `1` | 告诉第三方模型「延迟工具」协议的存在，需与桥接同开 |
 | `ROUTER_IMAGE_BACKEND` | 自动 | `pil` / `sips` / `none`，图片降档编码器 |
 | `ROUTER_IMAGE_SHRINK` | `1` | `0` 完全关闭降档 |
-| `ROUTER_BODY_BYTE_LIMIT` | `6291456` | `body_byte_limit` 的全局兜底 |
+| `ROUTER_BODY_BYTE_LIMIT` | `4718592` | `body_byte_limit` 的全局兜底（转义口径，要自己实测，见上） |
+| `ROUTER_BODY_BYTE_BUDGET_RATIO` | `0.92` | 预算 = 硬顶 × 该比例；余量用来吸收上游阈值抖动（实测 ±1.7%） |
+| `ROUTER_BODY_OFFLOAD_MAX` | `16` | 收到 TooLarge 后就地卸载的最大轮数。与 `ROUTER_MAX_RETRY` 分开计数，保证卸完的 body 一定会重发 |
+| `ROUTER_BODY_OFFLOAD_DECAY` | `0.88` | 每轮卸载的预算乘数，让一轮就能收敛 |
 | `ROUTER_INPUT_LIMIT` | `0` | `input_token_limit` 的全局兜底 |
 | `ROUTER_OVERLIMIT_SIG` | `range of input length` | 上游「输入超限」的错误签名 |
 | `ROUTER_TOOLARGE_SIG` | `max bytes to request body` | 上游「请求体过大」的错误签名 |
@@ -265,6 +298,14 @@ Codex 的登录门槛只检查 `~/.codex/auth.json` 处于 `apikey` 模式且密
 
 如果你的网关报错措辞不同，**改错误签名是第一件要试的事**：签名对不上，中转就没法把它
 翻译成 `context_length_exceeded`，Codex 的原生压缩也就唤不醒。
+
+决定中转「怎么给请求瘦身」的两个数，都是**你上游的属性**，而不是这份代码的属性，
+而且两个都能实测：
+
+| 探针 | 回答什么问题 | 喂给哪个配置 |
+|---|---|---|
+| `probe-responses-support.py` | 上游能不能吃下 Codex 真实的 Responses 请求 | `mode`：passthrough / translate |
+| `probe-body-byte-limit.py` | 上游实际收多少请求体字节、按什么口径算 | `body_byte_limit` |
 
 ## 许可
 

@@ -12,3 +12,4 @@
 | [0005](0005-context-window-and-compaction-trigger.md) | 上下文窗口与压缩触发点必须等于上游真实上限 | Accepted |
 | [0006](0006-deferred-tool-bridge.md) | 延迟工具桥接：translate 模式必须还原 Codex 的全部原生工具形态 | Accepted |
 | [0007](0007-cross-platform-by-default.md) | 跨平台是默认要求，平台特性必须可选且可降级 | Accepted |
+| [0009](0009-upstream-byte-limit-is-escaped-and-undersold.md) | 上游字节硬顶按「ASCII 转义后」计量，且宣称值不可信（实测 4.5MiB，非 6291456） | Accepted |

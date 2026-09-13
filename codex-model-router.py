@@ -230,10 +230,25 @@ MAX_RETRY = int(os.environ.get("ROUTER_MAX_RETRY", "4"))
 # 写死在代码里会让别人复用时莫名其妙地丢图或死锁。所以做成每条路由可选字段，
 # 缺省时用环境变量，再缺省用下面的保守默认值。
 #
-# 字节默认取 6MB 而不是"不限"：判错的代价不对称。给没有硬顶的网关设了 6MB，
+# 字节默认取 4.5MiB 而不是"不限"：判错的代价不对称。给没有硬顶的网关设了 4.5MiB，
 # 只是多降一档图片质量；给有硬顶的网关没设，则 TooLarge → 会话死锁（见 ADR 0004）。
-UPSTREAM_BODY_BYTE_LIMIT = int(os.environ.get("ROUTER_BODY_BYTE_LIMIT", "6291456"))
+#
+# ⚠ 这个数是**上游计量口径**下的字节，不是我们发出的字节 —— 见 _body_bytes。
+# 默认值 4,718,592 = 4.5 MiB 是实测得到的真实上限，**不等于**上游错误消息里
+# 宣称的 6,291,456：那个数是外层网关的，真正卡住请求的是模型层。二分实测
+# （纯 ASCII 填充）4,717,472 B 通过、4,790,560 B 被拒，阈值就在 4.5MiB 上。
+# 换了网关请用 probe-body-byte-limit.py 重新实测，别照抄错误消息里的数字
+# （见 ADR 0009）。
+UPSTREAM_BODY_BYTE_LIMIT = int(os.environ.get("ROUTER_BODY_BYTE_LIMIT", "4718592"))
 UPSTREAM_INPUT_LIMIT = int(os.environ.get("ROUTER_INPUT_LIMIT", "0"))  # 0 = 不设 token 护栏
+# 预算 = 硬顶 × 这个比例。留余量吸收上游阈值抖动（实测 ±1.7%）与计量误差。
+BODY_BYTE_BUDGET_RATIO = float(os.environ.get("ROUTER_BODY_BYTE_BUDGET_RATIO", "0.92"))
+# 收到 TooLarge 后就地卸载的最大轮数。**独立于 MAX_RETRY**：卸载完的 body 必须
+# 真的再发一次，否则等于白卸（旧实现共用重试计数，最后一轮卸完直接掉出循环，
+# 那个已经够小的 body 从未出门 → 实测卸到 4.59MB / 硬顶 4.72MB 仍然报错）。
+MAX_BODY_OFFLOAD = int(os.environ.get("ROUTER_BODY_OFFLOAD_MAX", "16"))
+# 每轮 TooLarge 把预算再收紧这么多，配合完整卸载链一次压到位。
+BODY_OFFLOAD_DECAY = float(os.environ.get("ROUTER_BODY_OFFLOAD_DECAY", "0.88"))
 # 压缩请求的可靠字符上限。按"任意内容 ≤ ~1.4 token/char"换算，与内容类型无关，
 # 无需 token 估算器（_est_tokens 的比率随内容漂移、不可靠）。默认 90 万字符
 # ⇒ ≤ ~98 万 token；接了 token 上限更小的网关时由 _limits_for() 自动收紧。
@@ -252,7 +267,8 @@ def _limits_for(route):
     """
     route = route or {}
     byte_limit = int(route.get("body_byte_limit") or UPSTREAM_BODY_BYTE_LIMIT)
-    budget = int(os.environ.get("ROUTER_BODY_BYTE_BUDGET", "0")) or int(byte_limit * 0.92)
+    budget = int(os.environ.get("ROUTER_BODY_BYTE_BUDGET", "0")) \
+        or int(byte_limit * BODY_BYTE_BUDGET_RATIO)
     tok = int(route.get("input_token_limit") or UPSTREAM_INPUT_LIMIT or 0)
     if tok > 0:
         # 换算用**最坏比率** 1.4 token/char（本文件其它处一致采用），保证
@@ -398,7 +414,18 @@ def repair_tool_pairs(msgs):
             out.append(reply)
         for orphan in replies:
             log(f"   [warn] 游离 tool 消息 tool_call_id={orphan}，已丢弃")
-    return out
+    # 第二遍：丢掉**整条悬空**的 tool 消息。上面的收集只在 assistant(tool_calls)
+    # 之后进行，所以「调用它的那条 assistant 消息已经被卸载链整条丢掉」的情况漏网
+    # —— _drop_oldest_message 正是会这么干。这种 tool 消息上游同样 400。
+    known = {tc["id"] for m in out for tc in (m.get("tool_calls") or [])}
+    cleaned = []
+    for m in out:
+        if m.get("role") == "tool" and m.get("tool_call_id") not in known:
+            log(f"   [warn] 悬空 tool 消息 tool_call_id={m.get('tool_call_id')}"
+                f"（对应调用已不在历史里），已丢弃")
+            continue
+        cleaned.append(m)
+    return cleaned
 
 
 # ── 延迟工具桥接：让第三方模型也能用 codex 的原生工具 ──────────────────────
@@ -767,19 +794,45 @@ def _image_bytes(part):
 #   TooLarge → 压缩 → 仍 TooLarge → 再压缩 → 重试耗尽 → codex 给出终态
 #   "ran out of room in the model's context window"。而那个假信号让 codex 以为该压文本，
 #   方向从一开始就错了。
-# 为什么开环预算挡不住：旧实现只统计"图片 base64 合计 ≤ 4.5MB"，但 6MB 硬顶约束的是
+# 为什么开环预算挡不住：旧实现只统计"图片 base64 合计 ≤ 4.5MB"，但硬顶约束的是
 #   **整个序列化 body**——tools 定义（实测 42KB）、instructions（21KB）、历史文本、
 #   以及 JSON 转义全都不在统计内。预算检查永远看不见真实体积。
-# 修法：在 body 完全构建好之后实测字节，与发出去的完全同一种序列化，超了就逐级卸载：
-#   ① 丢最旧的图（字节大户，且 token 价值最低）→ ② 截最旧的文本。留 8% 余量吸收
-#   序列化差异。这样请求在出门前就一定合法，上游再没机会回 TooLarge。
+# 修法：在 body 完全构建好之后实测字节，超了就逐级卸载：① 降图片档位 → ② 丢最旧的
+#   图（字节大户，token 价值最低）→ ③ 截最长的文本。留 8% 余量吸收上游阈值抖动。
+#   这样请求在出门前就合法，上游再没机会回 TooLarge。
+# ⚠ 实测口径：这里的"字节"是 **ASCII 转义后**的字节数，不是我们发出的 UTF-8 字节数
+#   （上游按转义口径校验，中文差近一倍）；默认硬顶也是实测值而非错误消息里的宣称值。
+#   两者都由 probe-body-byte-limit.py 实测得到，细节见 ADR 0009。
 BODY_BYTE_BUDGET = int(os.environ.get(
-    "ROUTER_BODY_BYTE_BUDGET", str(int(UPSTREAM_BODY_BYTE_LIMIT * 0.92))))
+    "ROUTER_BODY_BYTE_BUDGET",
+    str(int(UPSTREAM_BODY_BYTE_LIMIT * BODY_BYTE_BUDGET_RATIO))))
 
 
 def _body_bytes(obj):
-    """实测一个请求体的真实线上字节数——与 call_upstream 用完全相同的序列化方式。"""
-    return len(json.dumps(obj, ensure_ascii=False).encode())
+    """实测一个请求体在**上游计量口径**下的字节数。
+
+    注意这不是我们发出的字节数。我们按 UTF-8 发（call_upstream 的
+    ensure_ascii=False，省一半带宽），但上游校验请求体大小时量的是
+    **ASCII 转义后**的形态：一个中文字符 UTF-8 占 3 B，转义成 \\uXXXX 占 6 B。
+    用发送字节做预算，等于把中文内容的体积低估近一倍。
+
+    二分实测（同一网关、同一模型，只变填充内容的中英比例，每点 6 轮收敛）：
+
+      非ASCII字符占比   实测可通过的发送字节   换算成转义字节   vs 4.5MiB
+        0.000            4,717,472             4,717,472        -0.0%
+        0.125            3,647,460             4,741,698        +0.5%
+        0.250            3,200,442             4,800,663        +1.7%
+        0.500            2,676,820             4,684,435        -0.7%
+        1.000            2,327,860             4,655,720        -1.3%
+
+    发送字节阈值随中文比例一路下滑（纯中文时只剩 ASCII 的一半），换算成转义字节后
+    五点全部收敛到 4,718,592 B（= 4.5 MiB）的 ±1.7% 内。所以计量口径是转义字节、
+    上限是 4.5 MiB —— 两个结论都由同一组数据给出，不是假设。
+
+    纯 ASCII 内容下转义字节 == 发送字节，图片 base64 也是纯 ASCII，所以这个口径
+    对英文会话没有任何收紧；只有中文（及其它非 ASCII）会话会被正确计入。
+    """
+    return len(json.dumps(obj, ensure_ascii=True))
 
 
 def _drop_oldest_image(chat):
@@ -809,6 +862,27 @@ def _shrink_oldest_text(chat):
     if cur < 2000:
         return False
     return _truncate_msg_content(msgs[idx], max(1000, cur // 2))
+
+
+def _drop_oldest_message(chat, keep_recent=2):
+    """卸载链的最后一步：整条丢掉最旧的非 system 消息。丢不动返回 False。
+
+    为什么必须有这一步：前两步（丢图、截文本）都有下界——图片丢光就没了，文本截断对
+    <2000 字符的消息直接放弃（再截就只剩噪音，不如整条不要）。于是一个由**大量中等
+    长度消息**堆起来的长会话，会在某个体积上停住再也压不下去。实测：4.04MB 的中文
+    历史只能压到 491KB 就触底，预算给 400KB 时永远收敛不了 → 请求必然失败。
+
+    保留 system + 最近 keep_recent 条，其余从最旧开始丢。丢完调用方会重跑
+    repair_tool_pairs，所以这里不用自己管 tool_call/tool 的配对。
+    """
+    msgs = chat.get("messages") or []
+    n_sys = 0
+    while n_sys < len(msgs) and msgs[n_sys].get("role") == "system":
+        n_sys += 1
+    if len(msgs) - n_sys <= keep_recent:
+        return False
+    del msgs[n_sys]
+    return True
 
 
 def _enforce_body_byte_limit(chat, budget=None, hard_limit=None):
@@ -842,7 +916,13 @@ def _enforce_body_byte_limit(chat, budget=None, hard_limit=None):
     while n > budget and _shrink_oldest_text(chat):
         truncated += 1
         n = _body_bytes(chat)
-    if dropped_imgs or truncated or retiered:
+    # ④ 截不动仍超 → 整条丢最旧的消息。②③ 都有下界（图丢光就没了；文本截断对
+    #    <2000 字符的消息直接放弃），长会话会在某个体积触底。这一步保证一定收敛。
+    dropped_msgs = 0
+    while n > budget and _drop_oldest_message(chat):
+        dropped_msgs += 1
+        n = _body_bytes(chat)
+    if dropped_imgs or truncated or retiered or dropped_msgs:
         # 卸载会改动消息内容，重跑配对修复，避免产生孤儿 tool_call。
         chat["messages"] = repair_tool_pairs(chat["messages"])
         n = _body_bytes(chat)
@@ -851,10 +931,11 @@ def _enforce_body_byte_limit(chat, budget=None, hard_limit=None):
             _d, _q = IMAGE_TIERS[retiered]
             _tier_desc = f" / 降档至 {_d}px q{_q}"
         log(f"   [body] 实测 {before:,} B 超预算({budget:,} B)，"
-            f"丢图 {dropped_imgs} 张 / 截文本 {truncated} 条{_tier_desc} → {n:,} B"
+            f"丢图 {dropped_imgs} 张 / 截文本 {truncated} 条"
+            f" / 丢消息 {dropped_msgs} 条{_tier_desc} → {n:,} B"
             f"（硬顶 {hard_limit:,}）")
     if n > budget:
-        # 理论上到不了：system 消息 + tools 定义就超预算。记下来让日志可查。
+        # 只有 system 消息 + tools 定义本身就超预算时才到得了这里（无历史可丢）。
         log(f"   [body] 警告：卸载后仍 {n:,} B > 预算 {budget:,} B")
 
 
@@ -1277,7 +1358,7 @@ def resp_req_to_chat(body, limits=None):
     #    序列化字节**——和发出去的一模一样，不靠图片 base64 开环估算。超预算就逐级卸载
     #    （先丢最旧图，再截最旧文本）。这是根治 TooLarge→压缩→仍 TooLarge 死锁的关键：
     #    之前的开环预算只数图片字节，漏掉 tools 定义、文本、JSON 转义，导致真实 body
-    #    冲破 6MB 硬顶，而压缩降的是 token、图片字节不动 → 死循环到"ran out of room"。
+    #    冲破硬顶，而压缩降的是 token、图片字节不动 → 死循环到"ran out of room"。
     _enforce_body_byte_limit(chat, _lim.get("byte_budget"), _lim.get("byte_limit"))
     return chat
 
@@ -1618,7 +1699,10 @@ def call_upstream(route, path, payload, accept, timeout=900):
         route["base"] + path,
         # ensure_ascii=False：默认 True 会把中文转义成 \uXXXX（每字 6 字节），
         # 实测同样内容 body 字节翻倍。上游接受 UTF-8（已实测中文往返无损），
-        # 故按 UTF-8 直接编码，body 立减一半——这是 6MB 硬顶下最便宜的一击。
+        # 故按 UTF-8 直接编码，发送体积立减一半（省带宽）。
+        # 注意：这**不能**用来绕开上游的字节硬顶——上游校验请求体大小时量的是
+        # ASCII 转义后的字节，我们少发一半、它算的还是全量（实测见 ADR 0009）。
+        # 所以预算口径在 _body_bytes 里按转义算，与这里故意不同。
         data=json.dumps(payload, ensure_ascii=False).encode(),
         headers={"Authorization": f"Bearer {key}",
                  "Content-Type": "application/json; charset=utf-8",
@@ -1714,7 +1798,18 @@ class Handler(BaseHTTPRequestHandler):
         up = None
         last = None
         overlimit_large = False
-        for attempt in range(1, MAX_RETRY + 1):
+        # 两个独立计数器：attempt = 对瞬时错误的退避重试次数；
+        # offload = 对字节超限的就地卸载轮数。必须分开：旧实现共用一个计数，
+        # 导致「卸载完的 body 还没来得及发，循环就结束了」——实测某请求连卸 4 轮
+        # 到 4,586,879 B（已低于硬顶），但第 4 轮的 continue 直接掉出 for 循环，
+        # 那个已经够小的 payload 从未发出，请求照样失败（见 ADR 0009）。
+        attempt = 0
+        offload = 0
+        while True:
+            attempt += 1
+            if attempt > MAX_RETRY + MAX_BODY_OFFLOAD + 1:
+                log("   [body] 重试/卸载轮数超上限，放弃")  # 兜底，防意外死循环
+                break
             try:
                 up = call_upstream(route, path, payload,
                                    self.headers.get("Accept"))
@@ -1728,14 +1823,36 @@ class Handler(BaseHTTPRequestHandler):
                 # 循环到重试耗尽 → 用户看到 "ran out of room"（实测 token 才 57%）。
                 # 正确做法是在路由内就地卸载（丢最旧图 / 截最长文本）后重试同一请求。
                 if TOOLARGE_SIG in _low and mode != "passthrough":
+                    if offload >= MAX_BODY_OFFLOAD:
+                        log(f"   [body] 上游 TooLarge：已卸载 {offload} 轮仍被拒，放弃")
+                        break
+                    offload += 1
                     before = _body_bytes(payload)
-                    if _drop_oldest_image(payload) or _shrink_oldest_text(payload):
-                        payload["messages"] = repair_tool_pairs(payload["messages"])
-                        log(f"   [body] 上游 TooLarge：就地卸载 {before:,} B → "
-                            f"{_body_bytes(payload):,} B，重试第 {attempt} 次")
-                        continue
-                    log("   [body] 上游 TooLarge 但已无可卸载内容，放弃")
-                    break
+                    # 每轮跑**完整卸载链**（降档 → 丢最旧图 → 截最长文本 → 丢最旧消息）。
+                    # 旧实现每轮只走一步（丢一张图或截一条文本），要靠多轮才收敛，
+                    # 而轮数又和重试计数共用 → 没收敛完就退出。
+                    #
+                    # 目标预算取两个来源的**较小值**，这一步是关键：
+                    #   a) 配置预算按轮数衰减 —— 正常情况一次压到位；
+                    #   b) 当前体积 × DECAY   —— 保证**每轮都有实质进展**。
+                    # 只要 (a) 会有洞：上游真实限额低于我们配置的硬顶时（实测常态，
+                    # 见 ADR 0009），body 可能已经小于衰减后的配置预算、却仍被上游拒。
+                    # 那时卸载函数进来一看没超预算就直接返回、什么都没做，外层判定
+                    # "已无可卸载内容"放弃 —— 明明还有一整个历史可以丢。
+                    budget = max(min(int(limits["byte_budget"] *
+                                         (BODY_OFFLOAD_DECAY ** offload)),
+                                     int(before * BODY_OFFLOAD_DECAY)), 1024)
+                    _enforce_body_byte_limit(payload, budget, limits["byte_limit"])
+                    after = _body_bytes(payload)
+                    if after >= before:
+                        log(f"   [body] 上游 TooLarge 但已无可卸载内容"
+                            f"（{before:,} B，目标 {budget:,} B），放弃")
+                        break
+                    log(f"   [body] 上游 TooLarge：就地卸载 {before:,} B → "
+                        f"{after:,} B（预算收紧至 {budget:,}），"
+                        f"第 {offload}/{MAX_BODY_OFFLOAD} 轮重发")
+                    attempt -= 1  # 卸载不占退避重试次数
+                    continue
                 # 真超限(token 维度、请求确实很大)→ 不重试，转 context_length_exceeded
                 # 唤醒 codex 原生压缩；小请求的同签名错误 = 上游瞬时抖动 → 走下面的重试。
                 if OVERLIMIT_SIG in _low and _payload_chars > limits["overlimit_chars"]:
@@ -1843,7 +1960,15 @@ def main():
         _l = _limits_for(c)
         _tok = f"{_l['token_limit']:,}tok" if _l["token_limit"] else "unbounded"
         log(f"  {m:24s} {c['mode']:12s} -> {c['base']}  (${c['key_env']})"
-            f"  body<={_l['byte_limit']:,}B  input<{_tok}")
+            f"  body<={_l['byte_limit']:,}B(预算{_l['byte_budget']:,})  input<{_tok}")
+    # body 预算的口径必须写清楚：它量的是 **ASCII 转义后**的字节，不是我们发出的
+    # UTF-8 字节（见 _body_bytes）。日志里只写 "body<=4,718,592B" 会让人以为
+    # 那就是发送体积，中文会话下两者差近一倍。
+    # 预算是**按路由**的（硬顶可逐条覆盖），所以这行只讲口径与策略，具体数值看
+    # 上面每条路由那行的 body<=；把全局默认值写在这里会让人误以为它对所有路由生效。
+    log(f"  body 预算口径 = ASCII 转义后字节（上游校验用，非发送字节）；"
+        f"预算 = 各路由硬顶 × {BODY_BYTE_BUDGET_RATIO:.2f}；"
+        f"收到 TooLarge 就地卸载，最多 {MAX_BODY_OFFLOAD} 轮、每轮预算 ×{BODY_OFFLOAD_DECAY}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 
 

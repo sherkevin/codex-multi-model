@@ -91,6 +91,7 @@ set. Both switches are on by default and log their state at startup.
 | **Config dedup tool** | `tools/codex-config-dedup.py` | Self-heals `config.toml` duplicate-key parse errors (see below) |
 | **Service templates** | `service/` | launchd (macOS) / systemd (Linux) / Scheduled Task (Windows) templates to run the router always-on |
 | **Responses probe** | `probe-responses-support.py` | Empirically decides passthrough vs translate per model (see ADR 0001) |
+| **Byte-limit probe** | `probe-body-byte-limit.py` | Measures the upstream's real request-body cap and *how it counts bytes* (see ADR 0009) |
 | **Setup guide (zh)** | `多模型接入手册.md` | Principles, step-by-step, protocol invariants, troubleshooting |
 
 ---
@@ -199,6 +200,20 @@ This tool detects an unparseable `config.toml`, removes the redundant duplicate 
 
 ---
 
+## Tests
+
+```bash
+python3 tests/test_body_byte_limit.py
+```
+
+Stdlib only, no network, no upstream quota consumed — it starts a mock upstream that
+enforces the limit the way a real one does (counting escaped bytes) and drives a real
+router process against it. It covers the two byte-guard bugs documented in ADR 0009:
+the measurement convention, and the offload loop that used to discard its own result.
+Run it after changing anything in the byte guard.
+
+---
+
 ## Security
 
 - **Keys never touch config files**: real keys live only in env vars / `~/.codex/router-secrets.env` (chmod 600). `config.toml` stores only variable *names*. The console shows keys masked and never echoes plaintext.
@@ -220,6 +235,7 @@ This tool detects an unparseable `config.toml`, removes the redundant duplicate 
 ├── codex-model-router.py      ← the proxy (core)
 ├── regen-model-catalog.py     ← model catalog generator
 ├── probe-responses-support.py ← passthrough-vs-translate probe (4-stage, see ADR 0001)
+├── probe-body-byte-limit.py   ← measures the upstream's real body cap + counting convention (ADR 0009)
 ├── 多模型接入手册.md            ← setup guide (zh)
 ├── run-router.bat             ← Windows foreground launcher
 ├── service/                   ← always-on templates (macOS / Linux / Windows)
@@ -227,6 +243,8 @@ This tool detects an unparseable `config.toml`, removes the redundant duplicate 
 │   ├── codex-model-router.service.example
 │   └── install-windows-service.ps1
 ├── docs/adr/                  ← architecture decision records (the "why")
+├── tests/
+│   └── test_body_byte_limit.py ← regression tests for the byte guard (stdlib only, no upstream calls)
 ├── tools/
 │   ├── codex-config-dedup.py          ← config.toml duplicate-key self-healer
 │   ├── codex-config-dedup.plist.example
@@ -247,13 +265,30 @@ secrets in the repo, no code edits needed to add a provider.
 
 | Field | Meaning | Default |
 |---|---|---|
-| `body_byte_limit` | upstream hard cap on request body bytes | `6291456` |
+| `body_byte_limit` | upstream hard cap on request body bytes, **measured the way the upstream measures it** (see below) | `4718592` |
 | `input_token_limit` | upstream hard cap on input tokens | `0` = unset |
 
 Set `input_token_limit` whenever your gateway enforces one. It caps the size of the
 compaction request so compaction can always succeed, and it lets the router tell a real
 over-limit response from transient flakiness. Both fields can also be set on a provider
 to apply to all its models.
+
+> **Measure `body_byte_limit`, do not read it off the error message.** Two things bite
+> here, both found the hard way (ADR 0009):
+>
+> 1. The number in `Exceeded limit on max bytes to request body : 6291456` is *not* the
+>    threshold that actually rejects your request. Measured on that same gateway, the real
+>    limit was `4,718,592` B (4.5 MiB) — 25% lower. The advertised figure belongs to an
+>    outer layer; the model layer is what actually refuses.
+> 2. The upstream counts **ASCII-escaped** bytes, not the UTF-8 bytes we send. A CJK
+>    character is 3 B in UTF-8 but 6 B as `\uXXXX`. Bisecting with fills of different
+>    language mixes shows the sendable-bytes threshold falling to exactly half for pure
+>    CJK, while the escaped-bytes threshold stays constant within ±1.7%.
+>
+> The router budgets in escaped bytes to match. Sending with `ensure_ascii=False` still
+> halves your bandwidth — it just does not buy back any room against this limit.
+> Run `probe-body-byte-limit.py` to measure both the convention and the threshold for
+> your own gateway; it prints a `body_byte_limit` value you can paste straight in.
 
 **Environment variables** (all optional):
 
@@ -265,7 +300,10 @@ to apply to all its models.
 | `ROUTER_NATIVE_HINT` | `1` | tell third-party models the deferred-tool protocol exists. Only useful with the bridge on |
 | `ROUTER_IMAGE_BACKEND` | auto | `pil` / `sips` / `none` — image downscaling encoder |
 | `ROUTER_IMAGE_SHRINK` | `1` | `0` disables downscaling entirely |
-| `ROUTER_BODY_BYTE_LIMIT` | `6291456` | global fallback for `body_byte_limit` |
+| `ROUTER_BODY_BYTE_LIMIT` | `4718592` | global fallback for `body_byte_limit` (escaped bytes — measure yours, see above) |
+| `ROUTER_BODY_BYTE_BUDGET_RATIO` | `0.92` | budget = limit × ratio; the slack absorbs upstream threshold jitter (measured ±1.7%) |
+| `ROUTER_BODY_OFFLOAD_MAX` | `16` | max in-place offload rounds after a `TooLarge`. Counted separately from `ROUTER_MAX_RETRY` so an offloaded body is always re-sent |
+| `ROUTER_BODY_OFFLOAD_DECAY` | `0.88` | budget multiplier per offload round, so one round usually converges |
 | `ROUTER_INPUT_LIMIT` | `0` | global fallback for `input_token_limit` |
 | `ROUTER_OVERLIMIT_SIG` | `range of input length` | upstream "input too long" signature |
 | `ROUTER_TOOLARGE_SIG` | `max bytes to request body` | upstream "body too large" signature |
@@ -277,6 +315,14 @@ to apply to all its models.
 Changing the error signatures is the first thing to try if your gateway reports
 over-limit differently: without a matching signature the router cannot translate the
 error into the `context_length_exceeded` that wakes Codex's compaction.
+
+Both numbers that decide *how* the router shrinks a request are properties of your
+upstream, not of this code, and both are measurable:
+
+| Probe | Question it answers | Feeds |
+|---|---|---|
+| `probe-responses-support.py` | can the upstream eat Codex's real Responses request? | `mode`: passthrough vs translate |
+| `probe-body-byte-limit.py` | how many body bytes does it actually accept, and counted how? | `body_byte_limit` |
 
 ## License
 
