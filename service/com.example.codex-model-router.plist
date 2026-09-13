@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS：把中转装成 launchd 用户级守护（开机自起、崩溃自拉）。
+
+  用法：把下面占位符替换成你的实际值，另存为
+        ~/Library/LaunchAgents/com.<你的标识>.codex-model-router.plist
+  然后：launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<上面那个文件>
+        launchctl enable gui/$(id -u)/com.<你的标识>.codex-model-router
+
+  重启中转（改完配置/环境变量后）：
+        launchctl kickstart -k gui/$(id -u)/com.<你的标识>.codex-model-router
+  看日志：tail -f <LOG>
+  卸载：  launchctl bootout gui/$(id -u)/com.<你的标识>.codex-model-router
+
+    <PYTHON>       python3 绝对路径（which python3）
+    <SCRIPT>       codex-model-router.py 绝对路径
+    <CODEX_HOME>   你的 ~/.codex 绝对路径（留空则用默认）
+    <LOG>          日志路径（macOS 上 /tmp 存在，可直接用 /tmp/codex-model-router.log）
+
+  关键：launchd 不会加载你的 ~/.zshrc，所以上游 AK 必须在下面 EnvironmentVariables
+  里显式给出，否则路由会报"缺少 XXX_API_KEY"。要么直接写值，要么改用下面这段
+  「走一层 shell 去 source rc 文件」的写法。
+
+  替代写法（让 AK 从 rc 文件来）：把下面的 ProgramArguments 整段换成
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/zsh</string><string>-c</string>
+      <string>source ~/.zshrc &gt;/dev/null 2&gt;&amp;1; exec &lt;PYTHON&gt; &lt;SCRIPT&gt;</string>
+    </array>
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.codex-model-router</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>&lt;PYTHON&gt;</string>
+    <string>&lt;SCRIPT&gt;</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CODEX_HOME</key>
+    <string>&lt;CODEX_HOME&gt;</string>
+    <!-- 每个 provider 的 key_env 都要在这里出现一次 -->
+    <key>EXAMPLE_GATEWAY_API_KEY</key>
+    <string>&lt;你的AK&gt;</string>
+    <key>OPENAI_API_KEY</key>
+    <string>&lt;你的AK&gt;</string>
+    <!-- 可选开关，按需打开
+    <key>ROUTER_IMAGE_BACKEND</key><string>pil</string>
+    <key>ROUTER_DUMP_REQUESTS</key><string>1</string>
+    -->
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>&lt;LOG&gt;</string>
+  <key>StandardErrorPath</key>
+  <string>&lt;LOG&gt;</string>
+</dict>
+</plist>

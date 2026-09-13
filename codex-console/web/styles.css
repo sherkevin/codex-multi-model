@@ -102,4 +102,13 @@ table.routes tr.pfx td{color:var(--mut)}
 .mode{font-family:var(--mono);font-size:11px;padding:1px 7px;border-radius:6px;border:1px solid var(--line)}
 .mode.passthrough{color:var(--ok);border-color:var(--ok)}
 .mode.translate{color:var(--warn);border-color:var(--warn)}
+.mode-row{gap:14px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--bg2)}
+.seg-btn{background:none;color:var(--mut);border:0;padding:9px 16px;font-size:13px;cursor:pointer;
+  border-right:1px solid var(--line);transition:background .15s,color .15s}
+.seg-btn:last-child{border-right:0}
+.seg-btn:hover{color:var(--fg);background:var(--bg3)}
+.seg-btn.active{background:var(--acc);color:#fff;font-weight:600}
+.mode-info{margin-top:10px;font-size:12.5px;color:var(--mut);line-height:1.6}
+.mode-info code{font-family:var(--mono);color:var(--fg);background:var(--bg);padding:1px 5px;border-radius:5px}
 

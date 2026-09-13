@@ -1,6 +1,8 @@
 # codex-console
 
-Codex 多模型的**本地可视化配置台**。在浏览器里配好 API / AK / 模型 / 登录方式，一键重启 Codex，然后**回到 Codex 本体里正常用**——这个网页只负责配置，不是聊天客户端。
+Codex 多模型的**本地可视化配置台**。在浏览器里配好 API / AK / 模型 / 登录方式，然后**回到 Codex 本体里正常用**——这个网页只负责配置，不是聊天客户端。
+
+配置读写**全平台可用**（macOS / Linux / Windows）；「一键重启」是 macOS 专属便利，其它平台会返回操作指引而不是静默失败（见能力③）。
 
 > 它是 [`codex-model-router`](../多模型接入手册.md) 的配套前端。先把中转跑起来（默认 `127.0.0.1:8317`），本工具才有意义。
 
@@ -32,7 +34,7 @@ Codex 多模型的**本地可视化配置台**。在浏览器里配好 API / AK 
 
 **② 绕过账号登录** — Codex 登录门只校验 `auth.json` 处于 `apikey` 模式且有任意非空 key；用一个占位串即可过门，真实模型鉴权由中转各自的 AK 完成，与这个占位 key 无关。「修复登录绕过」按钮在 `codex logout` 或升级把它重置后一键恢复。
 
-**③ 一键重启 Codex** — 主按钮重启 **Codex 桌面 App**（`/Applications/ChatGPT.app`，即 `killall ChatGPT` + `open`），让模型目录等改动立即生效；**会关闭当前在途会话**，故带二次确认。另有「重启中转」按钮，供改 AK / 路由后生效（`launchctl kickstart`，label 自动探测）。
+**③ 一键重启 Codex（仅 macOS）** — 主按钮重启 **Codex 桌面 App**（`/Applications/ChatGPT.app`，即 `killall ChatGPT` + `open`），让模型目录等改动立即生效；**会关闭当前在途会话**，故带二次确认。另有「重启中转」按钮，供改 AK / 路由后生效（`launchctl kickstart`，label 自动探测）。这两个按钮依赖 `launchctl` / `killall` / `open`，只在 macOS 有效；Linux / Windows 上点它们会返回一段「该怎么手动重启」的说明，不会抛异常——配置本身已经写好了，重启只是让它生效。
 
 **④ 在 Codex 里用** — 配置写完、重启完，回到 Codex 桌面 App 或 CLI，`/model` 里就是你配的模型，照常工作。本工具到此功成身退。
 
@@ -67,7 +69,11 @@ $$
 ./install-service.sh     # 装成 launchd 常驻服务（开机自起、崩溃自拉、带密钥环境）
 ```
 
-`install-service.sh` 用 `zsh -c 'source ~/.zshrc; …'` 启动——这样服务进程才拿得到你的 AK 环境变量，密钥面板才能正确显示「已设置」。
+`run.sh` 与 `install-service.sh` 是 macOS / Linux 的便捷脚本（后者用 launchd 常驻）。
+任意平台都可以直接 `python server.py` 起前台。常驻方式见仓库根 `service/` 下的模板
+（launchd / systemd --user / 计划任务）。
+
+`install-service.sh` 用 `zsh -c 'source ~/.zshrc; …'` 启动——这样服务进程才拿得到你的 AK 环境变量，密钥面板才能正确显示「已设置」。非 macOS 平台若用 systemd / 计划任务常驻，需在那边显式给出 AK 环境变量，否则密钥面板会显示「未设置」。
 
 ### 环境变量
 | 变量 | 默认 | 说明 |
@@ -76,9 +82,9 @@ $$
 | `CODEX_CONSOLE_HOST` | `127.0.0.1` | 监听地址（**保持回环，勿改 0.0.0.0**） |
 | `CODEX_ROUTER_URL` | `http://127.0.0.1:8317` | 中转地址 |
 | `CODEX_HOME` | `~/.codex` | Codex 配置目录 |
-| `CODEX_DESKTOP_APP` | `/Applications/ChatGPT.app` | 重启目标 App |
-| `CODEX_DESKTOP_PROCESS` | `ChatGPT` | 重启目标进程名 |
-| `CODEX_ROUTER_LABEL` | 自动探测 | 中转的 launchd label |
+| `CODEX_DESKTOP_APP` | `/Applications/ChatGPT.app` | 重启目标 App（**仅 macOS 重启功能用到**） |
+| `CODEX_DESKTOP_PROCESS` | `ChatGPT` | 重启目标进程名（**仅 macOS**） |
+| `CODEX_ROUTER_LABEL` | 自动探测 | 中转的 launchd label（**仅 macOS**） |
 
 ---
 

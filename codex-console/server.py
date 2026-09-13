@@ -85,6 +85,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "router": router_alive(), "router_url": ROUTER})
             elif p == "/api/status":
                 self.api_status()
+            elif p == "/api/mode":
+                self._send(200, config_io.read_run_mode())
             elif p == "/api/models":
                 self.api_models()
             elif p == "/api/config":
@@ -182,6 +184,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_secrets()
             elif p == "/api/auth":
                 self._send(200, config_io.ensure_auth_bypass())
+            elif p == "/api/mode":
+                self.api_mode()
             elif p == "/api/routes":
                 self._send(200, config_io.write_routes_file(self._read_json()))
             elif p == "/api/restart":
@@ -210,6 +214,14 @@ class Handler(BaseHTTPRequestHandler):
     def api_restart(self):
         target = self._read_json().get("target", "desktop")
         res = config_io.restart_router() if target == "router" else config_io.restart_desktop()
+        self._send(200 if res.get("ok") else 500, res)
+
+    def api_mode(self):
+        target = (self._read_json().get("target") or "").strip()
+        if target not in ("custom", "native"):
+            self._send(400, {"error": "target 必须是 custom 或 native"})
+            return
+        res = config_io.set_run_mode(target)
         self._send(200 if res.get("ok") else 500, res)
 
 

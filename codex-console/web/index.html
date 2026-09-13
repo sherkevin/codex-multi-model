@@ -17,6 +17,7 @@
 </header>
 
 <section class="status-strip">
+  <div class="stat"><div class="k">运行模式</div><div class="v" id="stMode">—</div></div>
   <div class="stat"><div class="k">Codex 登录</div><div class="v" id="stLogin">—</div></div>
   <div class="stat"><div class="k">后端模式</div><div class="v" id="stBackend">—</div></div>
   <div class="stat"><div class="k">model_provider</div><div class="v" id="stProvider">—</div></div>
@@ -27,6 +28,21 @@
 <p class="consistency">↑ 实时取自 Codex 本体（<code>codex login status</code> + config.toml + 中转 <code>/v1/routes</code>），非网页缓存。下面改的就是这些文件，两边永远一致。</p>
 
 <main>
+  <!-- ⓪ 运行模式：自定义 ↔ 原生 -->
+  <details class="card" open>
+    <summary>⓪ 运行模式：自定义（中转）↔ 原生（ChatGPT 登录）</summary>
+    <p class="hint"><b>自定义</b>=走我们的中转 + 第三方模型 + 免登录绕过；<b>原生</b>=还原 ChatGPT 账号登录、model/provider 退回原生，一切复原。切换只动 <code>model</code>/<code>model_provider</code>/<code>review_model</code> + <code>auth.json</code>，其余配置原样保留；改前自动备份、可来回切。切完需重启桌面 App 生效。</p>
+    <div class="row mode-row">
+      <div class="seg" id="modeSeg">
+        <button type="button" data-mode="custom" class="seg-btn">自定义（中转）</button>
+        <button type="button" data-mode="native" class="seg-btn">原生（ChatGPT 登录）</button>
+      </div>
+      <button id="applyMode" class="btn primary">切换到所选模式</button>
+      <span id="modeMsg" class="msg"></span>
+    </div>
+    <div id="modeInfo" class="mode-info"></div>
+  </details>
+
   <!-- 后端模式 / 中转 -->
   <details class="card" open>
     <summary>后端模式 & 中转（model → 真实 provider，透明路由）</summary>

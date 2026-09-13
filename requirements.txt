@@ -1,0 +1,12 @@
+# codex-multi-model 的 Python 依赖。全部跨平台（macOS / Linux / Windows）。
+#
+# 核心中转（codex-model-router.py）**纯标准库即可跑**，下面两个都是可选增强：
+#
+# 1) Pillow —— 图片降档编码器。装了才能把过大的截图缩小重编码；
+#    没装时 macOS 会回落到系统自带的 sips，其它平台则只能按字节预算丢图（不降档）。
+#    实测 Pillow 比 sips 输出小 2.5 倍、快 4.5 倍，建议装。
+Pillow>=9.1.0
+
+# 2) tomlkit —— 仅可视化配置台（codex-console）需要，用它读写 config.toml 以
+#    逐字符保留你手写的注释与格式。只用中转的话可以不装。
+tomlkit>=0.11.0

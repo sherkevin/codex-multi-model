@@ -1,0 +1,44 @@
+# Linux：把中转装成 systemd **用户级**服务（登录自起、崩溃自拉）。
+#
+# 用法：
+#   1. 替换下面所有 <...> 占位符
+#   2. 装到用户单元目录并启用：
+#        mkdir -p ~/.config/systemd/user
+#        cp codex-model-router.service.example ~/.config/systemd/user/codex-model-router.service
+#        systemctl --user daemon-reload
+#        systemctl --user enable --now codex-model-router
+#   3. 开机自起（不登录也常驻）：
+#        loginctl enable-linger $USER
+#
+# 常用命令：
+#   systemctl --user restart codex-model-router     # 改完配置/环境变量后重启
+#   systemctl --user status  codex-model-router
+#   journalctl --user -u codex-model-router -f      # 看日志
+#
+# 关键：systemd 不读你的 shell rc 文件，上游 AK 必须显式给出。
+# 推荐用 EnvironmentFile 指到一个 600 权限的文件，避免 AK 出现在单元文件和 ps 输出里：
+#   echo 'EXAMPLE_GATEWAY_API_KEY=xxx' > ~/.codex/router-secrets.env
+#   chmod 600 ~/.codex/router-secrets.env
+
+[Unit]
+Description=Codex multi-model router (local Responses API proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=<PYTHON> <SCRIPT>
+Restart=always
+RestartSec=2
+
+# 你的 ~/.codex；留空则用默认 $HOME/.codex
+Environment=CODEX_HOME=<CODEX_HOME>
+# AK 从这个文件读（KEY=VALUE 每行一个，文件 chmod 600）。没有该文件时可删掉这行。
+EnvironmentFile=-<CODEX_HOME>/router-secrets.env
+# 可选开关，按需打开
+# Environment=ROUTER_IMAGE_BACKEND=pil
+# Environment=ROUTER_DUMP_REQUESTS=1
+# Environment=ROUTER_DUMP_PATH=<CODEX_HOME>/router-last-request.json
+
+[Install]
+WantedBy=default.target

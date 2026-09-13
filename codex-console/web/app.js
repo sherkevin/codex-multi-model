@@ -144,11 +144,61 @@ window.ccSetKey = async (k, btn) => {
   loadSecrets([k]);
 };
 
+// ── 运行模式（自定义 ↔ 原生）──
+let MODE = { mode: "custom" };
+let MODE_TARGET = null;
+
+async function loadMode() {
+  let m; try { m = await jget("/api/mode"); } catch (e) { return; }
+  MODE = m; MODE_TARGET = m.mode;
+  $("#stMode").textContent = m.mode === "native" ? "原生 ChatGPT" : "自定义 中转";
+  $$("#modeSeg .seg-btn").forEach(b => b.classList.toggle("active", b.dataset.mode === m.mode));
+  const info = $("#modeInfo");
+  const np = m.native_profile || {};
+  if (m.mode === "custom") {
+    info.innerHTML = `当前 <b>自定义</b> · model=<code>${esc(m.model || "?")}</code> · provider=<code>${esc(m.model_provider || "?")}</code> · effort=<code>${esc(m.model_reasoning_effort || "?")}</code> · 登录=<code>apikey 绕过</code>。`
+      + `<br>切到「原生」<b>完全割裂</b>：还原 ChatGPT 登录`
+      + (m.has_oauth_backup ? `（<code>${esc(m.oauth_backup)}</code>）` : `（⚠ 无登录备份，需 <code>codex login</code>）`)
+      + `，model→<code>${esc(np.model || "?")}</code>、effort→<code>${esc(np.model_reasoning_effort || "默认")}</code>，并<b>删除</b> model_provider / 自定义模型目录 / review_model / model_providers 表。`
+      + `共享设置（hooks / mcp_servers / plugins / features）两态都不动，不会 drift。`;
+  } else {
+    info.innerHTML = `当前 <b>原生</b> · model=<code>${esc(m.model || "?")}</code> · ChatGPT 登录${m.has_oauth_tokens ? "（OAuth）" : ""} · 无中转、无自定义模型目录。`
+      + `<br>切到「自定义」会精确还原中转 + 第三方模型 + 自定义目录 + apikey 免登录。`;
+  }
+}
+
+function selectMode(target) {
+  MODE_TARGET = target;
+  $$("#modeSeg .seg-btn").forEach(b => b.classList.toggle("active", b.dataset.mode === target));
+}
+
 // ── 动作 ──
-async function refreshAll() { await loadStatus(); await loadRoutes(); await loadConfig(); }
+async function refreshAll() { await loadStatus(); await loadMode(); await loadRoutes(); await loadConfig(); }
 
 function bind() {
   $("#refresh").onclick = refreshAll;
+  $$("#modeSeg .seg-btn").forEach(b => b.onclick = () => selectMode(b.dataset.mode));
+  $("#applyMode").onclick = async () => {
+    const target = MODE_TARGET;
+    if (!target || target === MODE.mode) { flash($("#modeMsg"), "已经在该模式，无需切换"); return; }
+    const warn = target === "native"
+      ? "切到「原生」：还原 ChatGPT 登录、model/provider 退回原生、停用中转。需重启桌面 App 生效。继续？"
+      : "切到「自定义」：恢复中转 + 第三方模型 + apikey 免登录。需重启桌面 App 生效。继续？";
+    if (!confirm(warn)) return;
+    $("#applyMode").disabled = true; flash($("#modeMsg"), "切换中…");
+    try {
+      const r = await jpost("/api/mode", { target });
+      let msg = r.detail || ("已切到 " + r.mode);
+      if (r.need_login) msg += " ⚠ 登录态可能已过期，请在终端跑一次 codex login";
+      flash($("#modeMsg"), msg, !!r.need_login);
+      await loadMode(); await loadStatus(); await loadConfig();
+      if (confirm("已切换。现在重启 Codex 桌面 App 让它生效？（会关闭在途会话）")) {
+        await jpost("/api/restart", { target: "desktop" });
+        flash($("#modeMsg"), "已重启桌面 App，稍候刷新"); setTimeout(refreshAll, 4000);
+      }
+    } catch (e) { flash($("#modeMsg"), "切换失败 " + e.message, true); }
+    finally { $("#applyMode").disabled = false; }
+  };
   $("#addProvider").onclick = () => {
     const n = prompt("provider 名字（如 openai / my-gateway）："); if (!n) return;
     STATE.providers[n] = { base: "", key_env: "" }; renderProviders();

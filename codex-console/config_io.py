@@ -8,10 +8,12 @@
   * 任何写入前都先备份成 *.bak-<时间戳>，写坏了能回滚。
 """
 import json
+import glob
 import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 
 try:
@@ -237,7 +239,18 @@ LOGIN_PLACEHOLDER = "sk-local-router-placeholder"
 
 
 def _codex_bin():
-    return shutil.which("codex") or "/opt/homebrew/bin/codex"
+    # PATH 里找；找不到再试各平台常见安装位置。/opt/homebrew 只是 macOS+Homebrew
+    # 的约定，Windows/Linux 完全不同，不能只留这一个兜底。
+    found = shutil.which("codex")
+    if found:
+        return found
+    home = os.path.expanduser("~")
+    for cand in ("/opt/homebrew/bin/codex", "/usr/local/bin/codex",
+                 os.path.join(home, ".local", "bin", "codex"),
+                 os.path.join(os.environ.get("APPDATA", home), "npm", "codex.cmd")):
+        if cand and os.path.exists(cand):
+            return cand
+    return "codex"
 
 
 def read_auth():
@@ -299,7 +312,20 @@ def codex_login_status():
 
 # ─────────────────────────── 重启 ───────────────────────────
 
+# 进程重启是**平台相关**的：macOS 用 launchctl/killall/open，Linux 用 systemctl，
+# Windows 用服务或计划任务。配置台不猜你的常驻方式，非 macOS 一律返回"怎么做"的指引
+# 而不是抛异常——配置读写本身是全平台可用的，只有"一键重启"这两个按钮受限。
+IS_MACOS = sys.platform == "darwin"
+RESTART_UNSUPPORTED = (
+    "配置台的「一键重启」仅支持 macOS（launchctl）。当前平台请手动重启："
+    "Windows 用「服务」/计划任务或结束进程后重跑；"
+    "Linux 用 systemctl --user restart <unit>。"
+    "配置读写不受影响。")
+
+
 def _detect_router_label():
+    if not IS_MACOS:
+        return None
     env = os.environ.get("CODEX_ROUTER_LABEL")
     if env:
         return env
@@ -316,6 +342,8 @@ def _detect_router_label():
 def restart_desktop():
     """重启 Codex 桌面 App（ChatGPT.app）。会关闭当前所有在途会话——用户已确认。
     不用 osascript（会卡自动化权限），直接 killall + open。"""
+    if not IS_MACOS:
+        return {"ok": False, "detail": RESTART_UNSUPPORTED}
     killed = subprocess.run(["killall", APP_PROCESS],
                             capture_output=True, text=True).returncode == 0
     time.sleep(1.2)
@@ -328,6 +356,8 @@ def restart_desktop():
 
 
 def restart_router():
+    if not IS_MACOS:
+        return {"ok": False, "detail": RESTART_UNSUPPORTED}
     label = _detect_router_label()
     if not label:
         return {"ok": False, "detail": "未找到中转的 launchd label（设 CODEX_ROUTER_LABEL 或确认中转已装为服务）"}
@@ -335,6 +365,176 @@ def restart_router():
                        capture_output=True, text=True)
     return {"ok": r.returncode == 0, "label": label,
             "detail": "已重启中转" if r.returncode == 0 else f"失败：{r.stderr.strip()[:160]}"}
+
+
+# ─────────────────── 运行模式：自定义(中转) ↔ 原生(ChatGPT 登录) ───────────────────
+#
+# 「完全割裂」：切换只整组替换"模式专属键"，两态互不残留——
+#   custom : model / model_provider=router / review_model / model_catalog_json /
+#            model_reasoning_effort / model_providers(中转+第三方) 全开；auth.json=apikey 占位
+#   native : 上述键全部退回"自定义之前"的原生值；原生没有的键（model_provider / review_model /
+#            model_catalog_json / model_providers 整张表）直接删除；auth.json=还原真实 ChatGPT OAuth
+# 共享键（hooks / mcp_servers / plugins / features / desktop / projects …）两态都不碰，避免来回切 drift。
+# 离开某态时把该态的模式专属键快照进 .console-run-mode.json，切回时精确还原。
+# 改前对 config.toml + auth.json 各备份一份。绝不自动重启 codex。
+
+MODE_STATE_PATH = os.path.join(CODEX_HOME, ".console-run-mode.json")
+NATIVE_DEFAULT_MODEL = "gpt-5.6-sol"   # 取不到原生备份时的兜底
+
+
+def _first_routed_model():
+    """从 router-routes.json 取第一个模型名，作为切回自定义时最后一级兜底。
+
+    正常情况下 custom 快照里就存着用户原本的 model，根本走不到这里。写死某个模型名
+    会让换网关的人切回自定义时落到一个他路由表里没有的模型上（router 会明确报错，
+    但用户会以为是切换坏了）。
+    """
+    try:
+        data = read_routes_file() or {}
+        for name in (data.get("models") or {}):
+            return name
+    except Exception:
+        pass
+    return NATIVE_DEFAULT_MODEL
+
+
+# 模式专属键：切换时整组替换；其余键视为共享、两态保留不动。
+MODE_KEYS = ("model", "model_provider", "review_model", "model_catalog_json",
+             "model_reasoning_effort", "model_providers")
+
+
+def _plain(v):
+    """tomlkit 值 → 纯 Python（可 JSON 序列化），用于快照。"""
+    if v is None:
+        return None
+    unwrap = getattr(v, "unwrap", None)
+    if callable(unwrap):
+        try:
+            return unwrap()
+        except Exception:
+            pass
+    return v
+
+
+def _find_chatgpt_auth_backup():
+    """最近的 auth.json.bak-chatgpt-*（含真实 ChatGPT OAuth 登录态）；没有则 None。"""
+    cands = sorted(glob.glob(os.path.join(CODEX_HOME, "auth.json.bak-chatgpt-*")))
+    return cands[-1] if cands else None
+
+
+def _detect_native_profile():
+    """从"自定义之前"的 config.toml.bak 推原生 profile：每个模式专属键的原生值，
+    原生没有的键记为 None（=切到 native 时应删除）。识别特征：有 model、无 model_provider。"""
+    for b in ("config.toml.bak", "config.toml.bak.bak"):
+        p = os.path.join(CODEX_HOME, b)
+        if not os.path.exists(p):
+            continue
+        try:
+            d = tomlkit.parse(open(p, "r", encoding="utf-8").read())
+        except Exception:
+            continue
+        if d.get("model") and "model_provider" not in d:
+            return {k: (_plain(d[k]) if k in d else None) for k in MODE_KEYS}
+    return {"model": NATIVE_DEFAULT_MODEL, "model_provider": None, "review_model": None,
+            "model_catalog_json": None, "model_reasoning_effort": None, "model_providers": None}
+
+
+def _apply_mode_keys(doc, profile):
+    """把 profile（{key: value|None}）应用到 tomlkit doc：None=删除该键，否则赋值。"""
+    for k in MODE_KEYS:
+        v = profile.get(k)
+        if v is None:
+            if k in doc:
+                del doc[k]
+        else:
+            doc[k] = v
+
+
+def _load_mode_state():
+    if os.path.exists(MODE_STATE_PATH):
+        try:
+            return json.load(open(MODE_STATE_PATH, "r", encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def read_run_mode():
+    """判定当前模式 + 隔离状态。custom=apikey 或 model_provider=router；否则 native。"""
+    auth = read_auth()
+    doc = load_config_doc()
+    provider = doc.get("model_provider")
+    is_custom = (auth.get("auth_mode") == "apikey") or (provider == "router")
+    backup = _find_chatgpt_auth_backup()
+    return {
+        "mode": "custom" if is_custom else "native",
+        "model": _plain(doc.get("model")),
+        "model_provider": _plain(provider),
+        "model_reasoning_effort": _plain(doc.get("model_reasoning_effort")),
+        "has_custom_catalog": "model_catalog_json" in doc,
+        "has_custom_providers": "model_providers" in doc,
+        "auth_mode": auth.get("auth_mode"),
+        "has_oauth_tokens": auth.get("has_oauth_tokens", False),
+        "has_oauth_backup": bool(backup),
+        "oauth_backup": os.path.basename(backup) if backup else None,
+        "native_profile": _detect_native_profile(),
+    }
+
+
+def set_run_mode(target):
+    """切换运行模式（custom/native），完全割裂：整组替换模式专属键 + 换 auth.json。
+    改前备份 config.toml + auth.json；快照当前态的模式专属键，切回时精确还原。"""
+    if target not in ("custom", "native"):
+        raise ValueError("target 必须是 custom 或 native")
+    cur = read_run_mode()
+    if cur["mode"] == target:
+        return {"ok": True, "changed": False, "mode": target, "detail": f"已是 {target} 模式"}
+
+    doc = load_config_doc()
+    state = _load_mode_state()
+    _backup(CONFIG_PATH)
+    _backup(AUTH_PATH)
+
+    # 快照"当前态"的模式专属键，供日后切回时精确还原（含整张 model_providers 表）
+    state[cur["mode"]] = {k: _plain(doc[k]) for k in MODE_KEYS if k in doc}
+
+    if target == "native":
+        _apply_mode_keys(doc, cur.get("native_profile") or _detect_native_profile())
+        _atomic_write(CONFIG_PATH, tomlkit.dumps(doc))
+        backup = _find_chatgpt_auth_backup()
+        restored_login = False
+        if backup:
+            shutil.copy2(backup, AUTH_PATH)
+            os.chmod(AUTH_PATH, 0o600)
+            restored_login = True
+        state["mode"] = "native"
+        _atomic_write(MODE_STATE_PATH, json.dumps(state, indent=2, ensure_ascii=False), chmod=0o600)
+        login = codex_login_status()
+        need_login = not (login.get("logged_in") and login.get("mode") == "chatgpt")
+        removed = [k for k in ("model_provider", "review_model", "model_catalog_json",
+                               "model_providers") if k not in doc]
+        return {"ok": True, "changed": True, "mode": "native",
+                "model": _plain(doc.get("model")), "restored_login": restored_login,
+                "need_login": need_login, "login_raw": login.get("raw", ""),
+                "removed_custom_keys": removed,
+                "detail": ("已切到原生：还原 ChatGPT 登录、删除中转 model_provider/自定义模型目录/"
+                           "review_model/model_providers 表，model 与思考档退回原生"
+                           + ("" if not need_login else "；登录态可能过期，请跑一次 codex login"))}
+
+    # target == custom：还原快照的 custom 模式专属键 + apikey 占位登录
+    saved = state.get("custom") or {}
+    if not saved:
+        saved = {"model": cur.get("model") or _first_routed_model(),
+                 "model_provider": "router"}
+    _apply_mode_keys(doc, saved)
+    _atomic_write(CONFIG_PATH, tomlkit.dumps(doc))
+    ensure_auth_bypass()
+    state["mode"] = "custom"
+    _atomic_write(MODE_STATE_PATH, json.dumps(state, indent=2, ensure_ascii=False), chmod=0o600)
+    return {"ok": True, "changed": True, "mode": "custom",
+            "model": _plain(doc.get("model")), "model_provider": _plain(doc.get("model_provider")),
+            "restored_keys": sorted(saved.keys()),
+            "detail": "已切回自定义（中转）：还原 model/provider/模型目录/review/思考档 + apikey 免登录；确认中转在跑"}
 
 
 # ─────────────────── 路由表（model → 真实 provider）───────────────────

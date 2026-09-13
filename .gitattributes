@@ -1,0 +1,27 @@
+# 行尾按文件类型固定，避免跨平台 checkout 把 Windows 脚本弄坏。
+#
+# .bat / .ps1 checkout 出来必须是 CRLF：cmd.exe 对 LF-only 的批处理解析有边界
+# 情况，PowerShell 虽然两种都吃，但统一 CRLF 更省事。eol=crlf 的语义是「仓库里
+# 存 LF、任何平台 checkout 都还原成 CRLF」，所以 core.autocrlf 在 macOS/Linux 上
+# 也不会把它们改坏，Windows 用户 clone 下来直接双击就能跑。
+
+# 默认：文本自动识别，提交时统一成 LF
+* text=auto eol=lf
+
+# Windows 专用脚本：仓库存 LF，checkout 一律还原 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# macOS launchd / Linux systemd 模板由对应平台读取，LF 即可
+*.plist text eol=lf
+*.service text eol=lf
+*.example text eol=lf
+
+# 二进制，别做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.icns binary
+*.sqlite binary
