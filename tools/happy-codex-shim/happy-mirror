@@ -1,0 +1,79 @@
+#!/bin/bash
+# happy-mirror — 用手机接管「电脑上任意一个正在跑的 Codex 窗口」
+#
+# 与普通 `happy codex` 的区别：普通模式是 Happy 自己新开一个 Codex 会话；
+# 这个模式把垫片塞进 PATH，于是 Happy 去 resume 一个**已被别的窗口占用**的
+# 线程时，不会撞 "already has an active writer" 报错，而是自动切镜像模式：
+# 实时看那个窗口的输入输出，并能插话（插话在对方当前回合结束后执行）。
+#
+# 用法：
+#   tools/happy-codex-shim/happy-mirror                # 交互选一个会话
+#   tools/happy-codex-shim/happy-mirror --list         # 只列出可接管的会话
+#   tools/happy-codex-shim/happy-mirror <thread-id>    # 直接接管指定会话
+#   tools/happy-codex-shim/happy-mirror --last         # 接管最近一个
+#
+# 环境变量：
+#   HAPPY_CODEX_SHIM=0     临时退回普通 happy codex（不打垫片）
+#   HAPPY_CODEX_SHIM_LOG   写垫片调试日志，例如 /tmp/shim.log
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+THREADS_TOOL="$REPO/tools/codex-threads.py"
+
+if [[ "${HAPPY_CODEX_SHIM:-1}" == "0" ]]; then
+  exec happy codex "$@"
+fi
+
+export PATH="$HERE/bin:$PATH"
+export CODEX_REAL="${CODEX_REAL:-$(command -v /opt/homebrew/bin/codex 2>/dev/null || echo codex)}"
+# 垫片必须能找到真 codex；PATH 里它自己排第一，靠 realpath 自识别跳过
+export HAPPY_CODEX_SHIM_LOG="${HAPPY_CODEX_SHIM_LOG:-}"
+
+list_threads() {
+  if [[ -f "$THREADS_TOOL" ]]; then
+    python3 "$THREADS_TOOL" "$@"
+  else
+    echo "找不到 $THREADS_TOOL" >&2
+    return 1
+  fi
+}
+
+case "${1:-}" in
+  --list|-l)
+    shift
+    list_threads "$@"
+    exit 0
+    ;;
+  "")
+    echo "此刻正在运行的会话（这些会被镜像接管：可看可插话，不打断对方）："
+    list_threads --all --live-only -n 20 || true
+    echo
+    echo "全部会话：      $0 --list"
+    echo "接管指定会话：  $0 <thread-id>"
+    echo "接管最近运行中：$0 --last"
+    exit 0
+    ;;
+  --last)
+    # codex-threads.py --json 输出扁平列表；--live-only 已按运行中过滤
+    TID="$(list_threads --all --live-only -n 1 --json 2>/dev/null \
+      | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print(d[0]["id"] if isinstance(d, list) and d else "")
+except Exception:
+    print("")')"
+    if [[ -z "${TID:-}" ]]; then
+      echo "此刻没有正在运行的会话。用 $0 --list 挑一个空闲会话接管。" >&2
+      exit 1
+    fi
+    echo "接管 $TID（镜像模式：可看可插话，不打断对方）"
+    exec happy codex --resume "$TID"
+    ;;
+  *)
+    TID="$1"
+    shift
+    echo "接管 $TID（镜像模式：可看可插话，不打断对方）"
+    exec happy codex --resume "$TID" "$@"
+    ;;
+esac

@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  happy-mirror-daemon 的 launchd 常驻服务模板（macOS）。
+
+  装上去之后，电脑上任何 Codex 窗口（CLI 或桌面端）一启动，
+  几秒内手机 Happy 的会话列表里就会出现它，可看可插话，且不打扰原窗口。
+
+  安装：把下面四处占位符替换成你的实际值，另存为
+        ~/Library/LaunchAgents/com.<你的标识>.happy-codex-mirror.plist
+  然后：
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.<你的标识>.happy-codex-mirror.plist
+  卸载：
+    launchctl bootout gui/$(id -u)/com.<你的标识>.happy-codex-mirror
+
+    <LABEL>    → 你的 LaunchAgent 标识，如 com.yourname.happy-codex-mirror
+                 （Label 键与文件名里的标识必须一致）
+    <PYTHON>   → python3 绝对路径（which python3）
+    <SCRIPT>   → happy-mirror-daemon.py 绝对路径
+    <REPO>     → 本仓库根目录绝对路径（WorkingDirectory）
+
+  注意：这里**不**用 `zsh -lc source ~/.zshrc` 那条路子（codex-model-router 用了）。
+  守护自己会 ensure_path() 把 node/happy/codex/lsof 补进 PATH，
+  依赖用户 rc 文件会让开机自启在 rc 还没准备好时静默失败。
+
+  非 macOS：launchd 不存在。守护本体仍可手动跑
+  `python3 happy-mirror-daemon.py`（前台循环），但开机自启需自行用
+  systemd / 计划任务等方式实现。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>&lt;LABEL&gt;</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>&lt;PYTHON&gt;</string>
+    <string>&lt;SCRIPT&gt;</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>WorkingDirectory</key>
+  <string>&lt;REPO&gt;</string>
+  <key>StandardOutPath</key>
+  <string>/tmp/happy-mirror-daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/happy-mirror-daemon.log</string>
+</dict>
+</plist>

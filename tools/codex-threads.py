@@ -21,6 +21,7 @@ codex-threads.py — 列出本机 Codex 会话，输出可直接用于接管的 
 """
 import argparse
 import datetime
+import glob
 import json
 import os
 import sqlite3
@@ -28,6 +29,49 @@ import sys
 
 CODEX_HOME = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
 DB = os.path.join(CODEX_HOME, "state_5.sqlite")
+LOCK_DIR = os.path.join(CODEX_HOME, "thread-writer-locks")
+
+
+def live_thread_ids():
+    """探测此刻正被某个 Codex 窗口持有（writer lock 被 flock 占住）的线程。
+
+    原理：每个正在运行的 CLI/桌面窗口都会对
+    ~/.codex/thread-writer-locks/<thread-id>.lock 持有排他 flock。
+    用 LOCK_NB 试锁一次：拿得到 = 空闲，拿不到 = 有窗口正在跑。
+    只试探、立刻释放，不会干扰任何窗口。
+
+    这批 id 正是「镜像接管」的目标：普通 resume 会撞
+    "already has an active writer"，需要走垫片。
+
+    fcntl 是 POSIX 专属：Windows 上 import 就 ImportError，会让整个脚本起不来。
+    所以这里**惰性导入**、失败即降级为空集合（ADR 0007：平台特性可选且可降级）。
+    调用方拿不到 live 标记时，--live-only 自然输出空列表，不报错。
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return set()
+    held = set()
+    for p in glob.glob(os.path.join(LOCK_DIR, "*.lock")):
+        name = os.path.basename(p)
+        if name.startswith("."):
+            continue
+        fd = None
+        try:
+            fd = os.open(p, os.O_RDWR | os.O_CREAT)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)  # 试到了就说明没人占，释放
+        except BlockingIOError:
+            held.add(name[: -len(".lock")])
+        except OSError:
+            continue
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    return held
 
 
 def humanize(ts):
@@ -58,6 +102,8 @@ def main():
     ap.add_argument("--grep", help="按标题或路径子串过滤")
     ap.add_argument("--json", action="store_true", help="输出 JSON")
     ap.add_argument("--copy-cmd", action="store_true", help="附带 happy 接管命令")
+    ap.add_argument("--live-only", action="store_true",
+                    help="只列出此刻正被某个窗口占用的会话（镜像接管的目标）")
     args = ap.parse_args()
 
     if not os.path.exists(DB):
@@ -75,6 +121,16 @@ def main():
         where.append("(title LIKE ? OR cwd LIKE ? OR first_user_message LIKE ?)")
         g = f"%{args.grep}%"
         params += [g, g, g]
+
+    # 运行中检测必须在 SQL 里做：否则 LIMIT 先截断、再过滤 live，
+    # 会漏掉排在 15 条之外但正在跑的会话（实测 4 个 held 只报出 3 个）。
+    live = live_thread_ids()
+    if args.live_only:
+        if not live:
+            where.append("1 = 0")
+        else:
+            where.append(f"id IN ({','.join('?' * len(live))})")
+            params += sorted(live)
 
     sql = f"""
         SELECT id, title, cwd, recency_at, cli_version, archived, model_provider,
@@ -95,7 +151,9 @@ def main():
         con.close()
 
     if args.json:
-        print(json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=1))
+        print(json.dumps(
+            [{**dict(r), "live": r["id"] in live} for r in rows],
+            ensure_ascii=False, indent=1))
         return 0
 
     if not rows:
@@ -109,7 +167,8 @@ def main():
             title = (r["first_msg"] or "").strip().replace("\n", " ") or "(无标题)"
         title = title[:60]
         cwd = (r["cwd"] or "").replace(os.path.expanduser("~"), "~")
-        print(f"{i:>3}. {r['id']}")
+        mark = " *运行中" if r["id"] in live else ""
+        print(f"{i:>3}. {r['id']}{mark}")
         print(f"     {title}")
         print(f"     {humanize(r['recency_at'])}  |  {cwd}  |  cli {r['cli_version'] or '?'}"
               f"  |  provider {r['model_provider'] or '?'}"
@@ -119,7 +178,10 @@ def main():
         if i < len(rows):
             print()
 
-    print(f"共 {len(rows)} 条。接管：happy codex --resume <thread-id>")
+    live_n = sum(1 for r in rows if r["id"] in live)
+    print(f"共 {len(rows)} 条，其中 {live_n} 条正在运行（标 *）。")
+    print("接管空闲会话： happy codex --resume <thread-id>")
+    print("接管运行中会话：tools/happy-codex-shim/happy-mirror <thread-id>")
     return 0
 
 

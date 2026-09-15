@@ -1,0 +1,696 @@
+#!/usr/bin/env node
+/**
+ * codex —— Happy 专用 app-server 垫片（mirror shim）
+ *
+ * 解决的问题：手机上的 Happy 想「看」并「插话」一个正在电脑上跑的 Codex 窗口
+ * （CLI TUI 或桌面端），但官方 app-server 明确禁止第二个进程接管活跃线程：
+ *
+ *     thread/resume -> {"code":-32600,"message":"thread <id> already has an active writer"}
+ *
+ * 这个垫片夹在 Happy 与真 codex 之间（靠 PATH 前置注入，不改 Happy 一行代码），
+ * 默认**纯透传**；只有当真 codex 亲口说「这个线程已被别人占用」时，才切到
+ * 镜像模式（mirror）：
+ *
+ *   监控（读）  尾随该线程的 rollout-*.jsonl，把 Codex 落盘的 snake_case 事件
+ *              翻译成 app-server 线格式的 camelCase 通知，实时喂给 Happy。
+ *              实测 rollout 在 turn 进行中就持续追加（41s 内 11 次增长），
+ *              且保真度高于 thread/turns/list 轮询（后者会丢 reasoning 与
+ *              中间 commandExecution 项，滞后 20~40s）。
+ *
+ *   注入（写）  走官方跨进程队列 thread/queue/add（落 ~/.codex/queue_1.sqlite）。
+ *              实测：宿主进程 ~2s 内收到 thread/queue/changed，当前 turn 跑完后
+ *              立刻自动开新 turn 执行注入内容。等价 CLI：codex queue --thread --message
+ *
+ *   不干扰     镜像模式**只读** rollout、**只追加** queue，从不申请 writer lock、
+ *              从不写 rollout。两个窗口各跑各的，谁也不会把谁顶掉。
+ *
+ * 历史回放仍走真 codex：thread/read 在被锁线程上可用（实测通过），
+ * 所以 Happy 的 resume-backfill 补丁照常工作，垫片不参与。
+ *
+ * 环境变量：
+ *   CODEX_REAL              真 codex 路径（默认按 PATH 找，跳过垫片自身）
+ *   HAPPY_CODEX_SHIM=0      完全禁用垫片，等同直接跑真 codex
+ *   HAPPY_CODEX_SHIM_LOG    调试日志路径（默认不写）
+ */
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+const SELF = fs.realpathSync(process.argv[1]);
+const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const LOG_PATH = process.env.HAPPY_CODEX_SHIM_LOG || '';
+
+function log(...args) {
+  if (!LOG_PATH) return;
+  try {
+    fs.appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')}\n`);
+  } catch {}
+}
+
+/** 找到真 codex：显式 CODEX_REAL 优先，否则在 PATH 里跳过垫片自己。 */
+function resolveRealCodex() {
+  if (process.env.CODEX_REAL) return process.env.CODEX_REAL;
+  const dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  for (const d of dirs) {
+    const cand = path.join(d, 'codex');
+    try {
+      if (fs.realpathSync(cand) === SELF) continue;
+      fs.accessSync(cand, fs.constants.X_OK);
+      return cand;
+    } catch {}
+  }
+  return 'codex';
+}
+
+const REAL = resolveRealCodex();
+const argv = process.argv.slice(2);
+
+// ── 非 app-server 调用：原样 exec，垫片完全不介入 ─────────────────────
+if (argv[0] !== 'app-server' || process.env.HAPPY_CODEX_SHIM === '0') {
+  const child = spawn(REAL, argv, { stdio: 'inherit' });
+  child.on('exit', (code, signal) => {
+    if (signal) process.kill(process.pid, signal);
+    else process.exit(code ?? 0);
+  });
+  for (const s of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(s, () => { try { child.kill(s); } catch {} });
+  }
+} else {
+  await main();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  rollout -> app-server 线格式翻译
+// ══════════════════════════════════════════════════════════════════════
+
+const CAMEL = s => String(s ?? '').replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
+
+/** rollout 里 cwd 是 file:///... URI，线格式要普通路径。 */
+function plainCwd(v) {
+  if (typeof v !== 'string') return v ?? null;
+  if (v.startsWith('file://')) {
+    try { return decodeURIComponent(new URL(v).pathname); } catch { return v.replace(/^file:\/\//, ''); }
+  }
+  return v;
+}
+
+function shellQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+/** rollout 的 command 可能是 argv 数组，线格式是一整行字符串。 */
+function commandString(item) {
+  const c = item.command;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c) && c.length) {
+    const parsed = Array.isArray(item.parsed_cmd) && item.parsed_cmd[0]?.cmd;
+    if (parsed) {
+      // 还原成 shell -lc 的常见形态，便于手机端阅读
+      if (c.length >= 3 && /(sh|bash|zsh)$/.test(String(c[0]))) return `${c[0]} ${c[1]} ${shellQuote(parsed)}`;
+      return parsed;
+    }
+    return c.map(x => (/\s/.test(String(x)) ? shellQuote(x) : String(x))).join(' ');
+  }
+  return '';
+}
+
+function durationMs(item) {
+  const d = item.duration;
+  if (d && typeof d === 'object' && typeof d.secs === 'number') {
+    return Math.round(d.secs * 1000 + (d.nanos || 0) / 1e6);
+  }
+  if (typeof item.duration_ms === 'number') return item.duration_ms;
+  return null;
+}
+
+function textOf(content) {
+  if (!Array.isArray(content)) return typeof content === 'string' ? content : '';
+  return content
+    .map(c => (typeof c === 'string' ? c : (c?.text ?? '')))
+    .join('');
+}
+
+/**
+ * rollout event_msg.item（snake_case）-> app-server ThreadItem（camelCase）。
+ * 返回 null 表示这个 item 手机端不需要看（例如压缩标记）。
+ */
+function toWireItem(it) {
+  if (!it || typeof it !== 'object') return null;
+  switch (it.type) {
+    case 'UserMessage':
+      return {
+        type: 'userMessage',
+        id: it.id,
+        clientId: it.client_id ?? null,
+        content: Array.isArray(it.content) ? it.content : [{ type: 'text', text: textOf(it.content), text_elements: [] }],
+      };
+    case 'AgentMessage':
+      return {
+        type: 'agentMessage',
+        id: it.id,
+        text: textOf(it.content),
+        phase: it.phase ?? null,
+        memoryCitation: null,
+        delivery: null,
+      };
+    case 'Reasoning':
+      return {
+        type: 'reasoning',
+        id: it.id,
+        summary: Array.isArray(it.summary_text) ? it.summary_text : [],
+        content: [],
+      };
+    case 'CommandExecution':
+      return {
+        type: 'commandExecution',
+        id: it.id,
+        pluginId: null,
+        scriptPath: null,
+        command: commandString(it),
+        cwd: plainCwd(it.cwd),
+        processId: it.process_id != null ? String(it.process_id) : null,
+        source: it.source ? CAMEL(it.source) : 'agent',
+        status: it.status ?? 'completed',
+        commandActions: Array.isArray(it.parsed_cmd)
+          ? it.parsed_cmd.map(p => ({ type: p.type ?? 'unknown', command: p.cmd ?? '' }))
+          : [{ type: 'unknown', command: commandString(it) }],
+        aggregatedOutput: it.aggregated_output ?? it.stdout ?? null,
+        exitCode: it.exit_code != null ? Number(it.exit_code) : null,
+        durationMs: durationMs(it),
+      };
+    case 'FileChange': {
+      const changes = [];
+      const src = it.changes;
+      if (src && typeof src === 'object' && !Array.isArray(src)) {
+        for (const [p, v] of Object.entries(src)) {
+          const kindType = v?.type ?? 'update';
+          changes.push({
+            path: p,
+            kind: kindType === 'update'
+              ? { type: 'update', move_path: v?.move_path ?? null }
+              : { type: kindType },
+            diff: v?.unified_diff ?? '',
+          });
+        }
+      } else if (Array.isArray(src)) {
+        for (const v of src) changes.push({ path: v?.path ?? '', kind: { type: v?.type ?? 'update' }, diff: v?.unified_diff ?? v?.diff ?? '' });
+      }
+      return { type: 'fileChange', id: it.id, changes, status: it.status ?? 'completed' };
+    }
+    case 'McpToolCall':
+      return {
+        type: 'mcpToolCall',
+        id: it.id,
+        server: it.server ?? 'mcp',
+        tool: it.tool ?? it.name ?? 'tool',
+        arguments: it.arguments ?? '',
+        result: it.result ?? null,
+        status: it.status ?? 'completed',
+        error: it.error ?? null,
+        pluginId: null,
+        readOnlyHint: null,
+      };
+    default:
+      // ContextCompaction 等：手机端无对应渲染，跳过
+      return null;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  主流程
+// ══════════════════════════════════════════════════════════════════════
+
+async function main() {
+  const child = spawn(REAL, argv, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: process.env,
+    windowsHide: true,
+  });
+  log('spawned real codex', REAL, argv);
+
+  child.stderr?.on('data', d => process.stderr.write(d));
+
+  // ── 镜像状态 ────────────────────────────────────────────────────
+  let mirror = null; // { threadId, path, offset, partial, turnId, timer }
+  // 已由垫片自己应答过的 Happy request id：真 codex 对这些 id 的后续响应一律吞掉，
+  // 避免 Happy 收到一条它没在等的错误（例如 resume 的 "already has an active writer"）
+  const answered = new Set();
+  const pendingResume = new Map(); // Happy 的 thread/resume request id -> params
+
+  const send = obj => {
+    try { process.stdout.write(JSON.stringify(obj) + '\n'); } catch {}
+  };
+  const note = (method, params) => send({ jsonrpc: '2.0', method, params, emittedAtMs: Date.now() });
+  const okResult = (id, result) => send({ jsonrpc: '2.0', id, result });
+  const errResult = (id, code, message) => send({ jsonrpc: '2.0', id, error: { code, message } });
+
+  // ── rollout 尾随 ────────────────────────────────────────────────
+  function drainRollout() {
+    if (!mirror?.path) return;
+    let size = 0;
+    try { size = fs.statSync(mirror.path).size; } catch { return; }
+    if (size <= mirror.offset) {
+      if (size < mirror.offset) mirror.offset = 0; // 文件被轮转/重写
+      return;
+    }
+    const buf = Buffer.alloc(size - mirror.offset);
+    let fd = null;
+    try {
+      fd = fs.openSync(mirror.path, 'r');
+      fs.readSync(fd, buf, 0, buf.length, mirror.offset);
+    } catch (e) {
+      log('rollout read error', e.message);
+      return;
+    } finally { if (fd != null) try { fs.closeSync(fd); } catch {} }
+    mirror.offset = size;
+
+    // 只处理完整行，残行留到下一轮
+    const text = mirror.partial + buf.toString('utf8');
+    const nl = text.lastIndexOf('\n');
+    mirror.partial = nl >= 0 ? text.slice(nl + 1) : text;
+    const lines = nl >= 0 ? text.slice(0, nl).split('\n') : [];
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let rec;
+      try { rec = JSON.parse(line); } catch { continue; }
+      handleRolloutRecord(rec);
+    }
+  }
+
+  function handleRolloutRecord(rec) {
+    const p = rec?.payload;
+    if (!p || typeof p !== 'object') return;
+    if (rec.type !== 'event_msg') return;
+
+    const tid = mirror.threadId;
+    switch (p.type) {
+      case 'task_started': {
+        mirror.turnId = p.turn_id || mirror.turnId;
+        note('thread/status/changed', { threadId: tid, status: { type: 'active', activeFlags: [] } });
+        note('turn/started', {
+          threadId: tid,
+          turn: { id: mirror.turnId, items: [], itemsView: 'notLoaded', status: 'inProgress', error: null, startedAt: p.started_at ?? null, completedAt: null, durationMs: null },
+        });
+        break;
+      }
+      case 'item_completed': {
+        const item = toWireItem(p.item);
+        if (!item) break;
+        const turnId = p.turn_id || mirror.turnId;
+        const at = p.completed_at_ms ?? p.started_at_ms ?? Date.now();
+        // 手机端要看到「开始」才知道有命令在跑；rollout 只在完成时落盘，
+        // 所以这里补一条 started，紧接 completed。
+        note('item/started', { threadId: tid, turnId, item, startedAtMs: p.started_at_ms ?? at });
+        note('item/completed', { threadId: tid, turnId, item, completedAtMs: at });
+        break;
+      }
+      case 'task_complete': {
+        const turnId = p.turn_id || mirror.turnId;
+        note('turn/completed', {
+          threadId: tid,
+          turn: { id: turnId, items: [], itemsView: 'notLoaded', status: 'completed', error: null, startedAt: null, completedAt: Math.floor(Date.now() / 1000), durationMs: null },
+        });
+        note('thread/status/changed', { threadId: tid, status: { type: 'idle' } });
+        break;
+      }
+      case 'token_count': {
+        const info = p.info?.total_token_usage;
+        if (!info) break;
+        note('thread/tokenUsage/updated', {
+          threadId: tid,
+          turnId: p.turn_id || mirror.turnId,
+          tokenUsage: {
+            total: {
+              totalTokens: info.total_tokens ?? 0,
+              inputTokens: info.input_tokens ?? 0,
+              cachedInputTokens: info.cached_input_tokens ?? 0,
+              cacheWriteInputTokens: info.cache_write_input_tokens ?? 0,
+              outputTokens: info.output_tokens ?? 0,
+              reasoningOutputTokens: info.reasoning_output_tokens ?? 0,
+            },
+          },
+        });
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  /**
+   * 判断线程此刻是否正跑在一个回合中间。
+   *
+   * 为什么需要：垫片是从「文件末尾」开始尾随的（历史由 Happy 的 thread/read 回放），
+   * 于是中途接入时会错过本轮的 task_started，手机端就以为对方闲着 —— 既不显示
+   * "运行中"，也不知道后面那串 item 属于哪个回合。所以接入时先回扫一次。
+   */
+  function detectActiveTurn(rolloutPath) {
+    let txt = '';
+    try {
+      const size = fs.statSync(rolloutPath).size;
+      const back = Math.min(size, 512 * 1024); // 回扫最后 512KB 足够覆盖一个回合
+      const fd = fs.openSync(rolloutPath, 'r');
+      try {
+        const buf = Buffer.alloc(back);
+        fs.readSync(fd, buf, 0, back, size - back);
+        txt = buf.toString('utf8');
+      } finally { try { fs.closeSync(fd); } catch {} }
+    } catch (e) {
+      log('detectActiveTurn read failed', e.message);
+      return null;
+    }
+    let started = null, completed = null;
+    for (const line of txt.split('\n')) {
+      if (!line.trim()) continue;
+      let rec; try { rec = JSON.parse(line); } catch { continue; } // 首行可能被截断，跳过
+      const p = rec?.payload;
+      if (rec?.type !== 'event_msg' || !p) continue;
+      if (p.type === 'task_started') started = { turnId: p.turn_id ?? null, at: p.started_at ?? 0 };
+      else if (p.type === 'task_complete' || p.type === 'task_aborted' || p.type === 'turn_aborted') {
+        completed = { turnId: p.turn_id ?? null, at: 1 };
+      }
+    }
+    if (!started) return null;
+    // 有 started 且其后没有对应的 complete -> 正在跑
+    if (completed && completed.turnId === started.turnId) return null;
+    return started.turnId;
+  }
+
+  function startMirror(threadId, rolloutPath) {
+    if (mirror?.threadId === threadId) return;
+    stopMirror();
+    // 从当前文件末尾开始：历史交给 Happy 的 thread/read 回放，避免重复推送
+    let offset = 0;
+    try { offset = fs.statSync(rolloutPath).size; } catch {}
+    mirror = { threadId, path: rolloutPath, offset, partial: '', turnId: null, timer: null };
+
+    // 中途接入补偿：如果对方正在跑，先把「运行中」状态和一个 turn/started 补上。
+    // turn id 用真实的，这样后续 item 才能挂到同一个回合上，手机端也才知道在等谁。
+    const activeTurn = detectActiveTurn(rolloutPath);
+    if (activeTurn) {
+      mirror.turnId = activeTurn;
+      note('thread/status/changed', { threadId, status: { type: 'active', activeFlags: [] } });
+      note('turn/started', {
+        threadId,
+        turn: { id: activeTurn, items: [], itemsView: 'notLoaded', status: 'inProgress', error: null, startedAt: null, completedAt: null, durationMs: null },
+      });
+      log('attached mid-turn, active turnId', activeTurn);
+    }
+
+    mirror.timer = setInterval(() => { try { drainRollout(); } catch (e) { log('drain error', e.message); } }, 350);
+    log('MIRROR ON', threadId, rolloutPath, 'offset', offset, 'activeTurn', activeTurn);
+    note('warning', {
+      threadId,
+      message: '镜像模式：此会话正在另一个 Codex 窗口中运行。手机端可实时查看并插话，插话会在对方当前回合结束后执行。',
+    });
+  }
+
+  function stopMirror() {
+    if (!mirror) return;
+    try { clearInterval(mirror.timer); } catch {}
+    log('MIRROR OFF', mirror.threadId);
+    mirror = null;
+  }
+
+  // ── 我们自己的 app-server 子连接：用于只读查询 + 队列注入 ─────────
+  let helper = null;
+  let helperReady = null;
+  let helperSeq = 0;
+  const helperPending = new Map();
+
+  function ensureHelper() {
+    if (helper) return helperReady;
+    helperReady = new Promise((resolve, reject) => {
+      const h = spawn(REAL, ['app-server', '--listen', 'stdio://'], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, RUST_LOG: 'off' },
+      });
+      h.stderr?.on('data', () => {});
+      createInterface({ input: h.stdout }).on('line', line => {
+        let m; try { m = JSON.parse(line); } catch { return; }
+        if (m.id !== undefined && (m.result !== undefined || m.error !== undefined)) {
+          const q = helperPending.get(m.id);
+          if (q) { helperPending.delete(m.id); m.error ? q.reject(new Error(m.error.message || JSON.stringify(m.error))) : q.resolve(m.result); }
+        }
+      });
+      h.on('exit', () => { helper = null; helperReady = null; });
+      helper = h;
+      hreq('initialize', {
+        clientInfo: { name: 'happy-codex-shim', title: 'Happy Codex Shim', version: '1.0.0' },
+        capabilities: { experimentalApi: true },
+      }).then(resolve, reject);
+    });
+    return helperReady;
+  }
+
+  function hreq(method, params, ms = 30000) {
+    return ensureHelperRaw().then(() => new Promise((resolve, reject) => {
+      const id = `shim-${++helperSeq}`;
+      helperPending.set(id, { resolve, reject });
+      try { helper.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); }
+      catch (e) { helperPending.delete(id); reject(e); return; }
+      setTimeout(() => {
+        if (helperPending.has(id)) { helperPending.delete(id); reject(new Error(`shim helper timeout: ${method}`)); }
+      }, ms);
+    }));
+  }
+
+  let helperBootstrapping = null;
+  function ensureHelperRaw() {
+    if (helper) return Promise.resolve();
+    if (helperBootstrapping) return helperBootstrapping;
+    helperBootstrapping = ensureHelper().then(() => { helperBootstrapping = null; }).catch(e => { helperBootstrapping = null; throw e; });
+    return helperBootstrapping;
+  }
+
+  // ── 镜像模式下自己应答的方法 ────────────────────────────────────
+  /**
+   * 取线程的真实模型名/提供方/推理档位。
+   *
+   * 为什么必须查 sqlite，不能用 thread/read：实测 thread/read 的 thread 对象
+   * 里**没有** model 字段（顶层键只有 modelProvider），model 只出现在
+   * thread/resume 的结果顶层——而那条恰恰是真 codex 拒绝、由垫片代为应答的。
+   * 所以镜像模式必须自己查一次，否则只能报 null（手机端就显示不出真实模型）。
+   *
+   * 只读连接 + busy_timeout：state_5.sqlite 正被桌面窗口持续写，
+   * 不设超时会偶发 SQLITE_BUSY。
+   *
+   * 用 `.timeout` 而不是 `PRAGMA busy_timeout=`：后者会把返回值 5000
+   * 当成一行结果回显，于是 split 出来的第一行是 "5000"，模型名直接解析错
+   * （实测踩到，解析出 model=5000）。`.timeout` 是点命令，不回显。
+   */
+  async function readThreadModel(threadId) {
+    try {
+      const { execFileSync } = await import('node:child_process');
+      const safeId = String(threadId).replace(/'/g, '');
+      const q = `select model, model_provider, reasoning_effort from threads where id='${safeId}'`;
+      const out = execFileSync('sqlite3', [
+        '-separator', '|', '-cmd', '.timeout 5000',
+        `file:${path.join(CODEX_HOME, 'state_5.sqlite')}?mode=ro`, q,
+      ], { encoding: 'utf8', timeout: 15000 }).trim();
+      if (!out) return null;
+      const [model, provider, effort] = out.split('\n')[0].split('|');
+      return {
+        model: model && model.length ? model : null,
+        modelProvider: provider && provider.length ? provider : null,
+        reasoningEffort: effort && effort.length ? effort : null,
+      };
+    } catch (e) {
+      log('readThreadModel failed', e.message);
+      return null;
+    }
+  }
+
+  async function mirrorResume(id, params) {
+    answered.add(id);
+    const threadId = params?.threadId;
+    let rolloutPath = null;
+    let threadObj = null;
+    try {
+      const rd = await hreq('thread/read', { threadId, includeTurns: false });
+      threadObj = rd?.thread ?? null;
+      rolloutPath = threadObj?.path ?? null;
+    } catch (e) {
+      log('mirror thread/read failed', e.message);
+    }
+    const realModel = await readThreadModel(threadId);
+    if (!rolloutPath) {
+      // 兜底：从 state_5.sqlite 找 rollout_path
+      try {
+        const { execFileSync } = await import('node:child_process');
+        const out = execFileSync('sqlite3', [
+          `file:${path.join(CODEX_HOME, 'state_5.sqlite')}?mode=ro`,
+          `select rollout_path from threads where id='${String(threadId).replace(/'/g, '')}'`,
+        ], { encoding: 'utf8' }).trim();
+        if (out && fs.existsSync(out)) rolloutPath = out;
+      } catch (e) { log('sqlite fallback failed', e.message); }
+    }
+    if (!rolloutPath || !fs.existsSync(rolloutPath)) {
+      errResult(id, -32600, `shim: cannot locate rollout for thread ${threadId}`);
+      return;
+    }
+    startMirror(threadId, rolloutPath);
+    okResult(id, {
+      thread: {
+        ...(threadObj || {}),
+        id: threadId,
+        sessionId: threadObj?.sessionId ?? threadId,
+        turns: [],
+        status: { type: 'active', activeFlags: [] },
+      },
+      // 真实模型名来自 sqlite，不是 threadObj（后者没有这个字段）。
+      // 少了这一步，手机端只能看到 Happy 的默认值或空白。
+      model: realModel?.model ?? threadObj?.model ?? params?.model ?? null,
+      modelProvider: realModel?.modelProvider ?? threadObj?.modelProvider ?? 'router',
+      serviceTier: null,
+      cwd: threadObj?.cwd ?? process.cwd(),
+      runtimeWorkspaceRoots: null,
+      instructionSources: null,
+      approvalPolicy: threadObj?.approvalPolicy ?? 'never',
+      approvalsReviewer: 'user',
+      sandbox: { mode: 'danger-full-access' },
+      activePermissionProfile: null,
+      reasoningEffort: realModel?.reasoningEffort ?? threadObj?.reasoningEffort ?? null,
+      multiAgentMode: null,
+      initialTurnsPage: null,
+      turnsBackwardsCursor: null,
+      itemsBackwardsCursor: null,
+    });
+  }
+
+  async function mirrorTurnStart(id, params) {
+    answered.add(id);
+    const threadId = params?.threadId || mirror?.threadId;
+    const text = (params?.input || [])
+      .map(i => (typeof i === 'string' ? i : (i?.text ?? '')))
+      .join('\n')
+      .trim();
+    if (!text) { errResult(id, -32600, 'shim: empty input'); return; }
+    const turnId = `shim-${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 8)}`;
+    try {
+      await hreq('thread/queue/add', {
+        threadId,
+        clientUserMessageId: `cmu-shim-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+        input: (params?.input || []).length ? params.input : [{ type: 'text', text, text_elements: [] }],
+      });
+      log('injected via thread/queue/add ->', threadId);
+      okResult(id, { turn: { id: turnId, items: [], itemsView: 'notLoaded', status: 'inProgress', error: null, startedAt: null, completedAt: null, durationMs: null } });
+      note('warning', { threadId, message: '已排队到桌面窗口。对方当前回合结束后会自动执行你这条消息。' });
+      await warnIfModelChangeIgnored(threadId, params);
+    } catch (e) {
+      log('queue/add failed', e.message);
+      errResult(id, -32600, `shim: queue injection failed: ${e.message}`);
+    }
+  }
+
+  /**
+   * 镜像模式下手机换模型不会生效，但只在「真的换了」时提醒。
+   *
+   * 为什么必须比较而不是「带了 model 就提醒」：happy 的 turn/start 参数里
+   * model 是**恒有值**的（它从 config.toml 读默认值，见 happy-patch.py 的
+   * config-model-default 补丁），所以无条件提醒会让每一条注入消息都弹一次
+   * 「你选的模型不会生效」——而用户根本没在换模型，纯噪音。
+   *
+   * 实测依据：thread/queue/add 会静默忽略 model 字段（带 model 与带任意未知
+   * 字段的响应完全一样），而 turn/start 带 model 是真的会换。所以镜像模式下
+   * 「选了但没生效」是事实，必须说；「没选」则不该说。
+   */
+  async function warnIfModelChangeIgnored(threadId, params) {
+    const wantModel = params?.model;
+    const wantEffort = params?.effort;
+    if (!wantModel && !wantEffort) return;
+    const cur = await readThreadModel(threadId);
+    if (!cur) return;  // 查不到真实值就不猜，避免误报
+    const modelDiffers = wantModel && cur.model && wantModel !== cur.model;
+    const effortDiffers = wantEffort && cur.reasoningEffort && wantEffort !== cur.reasoningEffort;
+    if (!modelDiffers && !effortDiffers) {
+      log('mirror turn/start model matches thread (no-op, no warning):',
+          wantModel, wantEffort);
+      return;
+    }
+    const want = [modelDiffers ? wantModel : null, effortDiffers ? wantEffort : null]
+      .filter(Boolean).join(' / ');
+    const now = [modelDiffers ? cur.model : null, effortDiffers ? cur.reasoningEffort : null]
+      .filter(Boolean).join(' / ');
+    log('mirror turn/start carried a DIFFERENT model/effort, ignored:',
+        want, 'thread uses', now);
+    note('warning', {
+      threadId,
+      message: `镜像模式无法切换模型：这个窗口正在用 ${now}，你选的 ${want} 没有生效。`
+             + `要换请在那个桌面/CLI 窗口里换。`,
+    });
+  }
+
+  // ── Happy -> child（请求）──────────────────────────────────────
+  createInterface({ input: process.stdin }).on('line', line => {
+    if (!line.trim()) return;
+    let msg;
+    try { msg = JSON.parse(line); } catch { try { child.stdin.write(line + '\n'); } catch {} return; }
+    log('>', line.slice(0, 400));
+
+    const isReq = msg.id !== undefined && msg.method !== undefined;
+    if (isReq && msg.method === 'thread/resume') {
+      // 记住它：若真 codex 报 "already has an active writer"，就切镜像自己应答
+      pendingResume.set(msg.id, { threadId: msg.params?.threadId, params: msg.params });
+    }
+    if (isReq && mirror && msg.params?.threadId === mirror.threadId) {
+      switch (msg.method) {
+        case 'turn/start':
+          mirrorTurnStart(msg.id, msg.params).catch(e => errResult(msg.id, -32603, `shim: ${e.message}`));
+          return;
+        case 'turn/interrupt':
+          // 不能真去打断别人窗口的回合（会破坏「不干扰」），如实告知
+          answered.add(msg.id);
+          okResult(msg.id, {});
+          note('warning', { threadId: mirror.threadId, message: '镜像模式不支持中断：那个回合属于另一个窗口，请在该窗口里停止。' });
+          return;
+        case 'thread/queue/add':
+        case 'thread/queue/list':
+        case 'thread/queue/delete':
+        case 'thread/queue/update':
+        case 'thread/queue/reorder':
+        case 'thread/queue/start':
+          // 队列类操作对镜像线程是安全的（官方跨进程通道），直接转给真 codex
+          break;
+        default:
+          break;
+      }
+    }
+    try { child.stdin.write(line + '\n'); } catch {}
+  });
+
+  // ── child -> Happy（响应 / 通知）───────────────────────────────
+  createInterface({ input: child.stdout }).on('line', line => {
+    if (!line.trim()) return;
+    let msg = null;
+    try { msg = JSON.parse(line); } catch {}
+    if (msg) {
+      // 垫片已自行应答过的 id：真 codex 的后续响应一律吞掉（例如 resume 的那条错误）
+      if (msg.id !== undefined && answered.has(msg.id)) {
+        log('swallowing child response for self-answered id', msg.id);
+        return;
+      }
+      if (msg.id !== undefined && msg.error && String(msg.error?.message || '').includes('already has an active writer')) {
+        const req = pendingResume.get(msg.id);
+        if (req) {
+          pendingResume.delete(msg.id);
+          log('resume blocked, switching to MIRROR for', req.threadId);
+          mirrorResume(msg.id, req.params).catch(e => errResult(msg.id, -32603, `shim: ${e.message}`));
+          return;
+        }
+      }
+      if (msg.id !== undefined && pendingResume.has(msg.id)) pendingResume.delete(msg.id);
+    }
+    log('<', line.slice(0, 400));
+    try { process.stdout.write(line + '\n'); } catch {}
+  });
+
+  child.on('exit', code => { stopMirror(); try { helper?.kill('SIGTERM'); } catch {} process.exit(code ?? 0); });
+  for (const s of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(s, () => { stopMirror(); try { child.kill(s); } catch {} try { helper?.kill(s); } catch {} });
+  }
+  process.on('exit', () => { stopMirror(); try { helper?.kill('SIGTERM'); } catch {} });
+}

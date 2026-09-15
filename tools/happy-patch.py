@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-happy-patch.py — 给 Happy CLI 打两个本地补丁，让它在「自定义 API 中转」环境下可用。
+happy-patch.py — 给 Happy CLI 打三个本地补丁，让它在「自定义 API 中转」环境下可用。
 
 背景：Happy（github.com/slopus/happy，MIT）是手机/网页端控制 Claude Code 与 Codex 的
 客户端，桌面侧用 `codex app-server --listen stdio://` 驱动 Codex，因此完全沿用
@@ -18,6 +18,16 @@ happy-patch.py — 给 Happy CLI 打两个本地补丁，让它在「自定义 A
      openai 前缀路由，返回 401 且重试 5 次）。本补丁改成优先读 config.toml 的
      model / model_reasoning_effort，读不到才回落到上游默认值。
      可用 HAPPY_CODEX_MODEL / HAPPY_CODEX_EFFORT 覆盖。
+
+  3. model-catalog-to-phone
+     手机端的模型选择器渲染的是会话 metadata 里的 `models` / `currentModelCode`，
+     而上游只有 ACP 后端会填这两个字段，codex 后端从不填，于是手机只能退回 App
+     内置的 GPT 清单——自定义模型（qwen3.8-max / GLM-5.2 / Kimi-K3 / MiniMax-M3）
+     一个都看不见。codex app-server 其实有官方 `model/list`，返回的正是
+     custom-model-catalog.json 那份清单，且 happy 建连时已声明 experimentalApi，
+     直接能调。本补丁在建连后、resume 后、新开会话后各报一次，并顺手接住
+     上游丢掉的 `resumedThread.model`（否则「当前模型」角标永远是空的）。
+     运行时可用 HAPPY_CODEX_MODEL_META=0 关闭。细节见 docs/adr/0013。
 
 实现要点：happy 的 bundle 有两份（.mjs 用裸 `logger`，.cjs 用 `api.logger`），
 补丁代码里统一写 `logger.debug(...)`，按 bundle 形态改写，避免 cjs 下 ReferenceError。
@@ -104,6 +114,93 @@ P2_BODY2 = (
     "    effort: opts.effort ?? readCodexConfigDefaults().effort"
 )
 
+# ── 补丁 3：把这台机器真正能用的模型清单报给手机 ─────────────────
+# 手机端那个模型选择器渲染的是会话 metadata 里的 `models` /
+# `currentModelCode`。上游只有 ACP 后端会填这两个字段，codex 后端从不填，
+# 于是手机只能退回 App 内置的 GPT 清单——自定义模型一个都看不见。
+# 而 codex app-server 其实有官方 `model/list`，返回的正是
+# custom-model-catalog.json 那 9 个（含 qwen3.8-max / GLM-5.2 / Kimi-K3 /
+# MiniMax-M3），且 happy 建连时已经声明了 experimentalApi，直接能调。
+P3_ANCHOR_FUNC = "async function resumeExistingThread(opts) {"
+P3_FUNC = '''// PATCH(local): report this machine's real model catalog to the phone.
+// The phone's picker renders metadata.models / metadata.currentModelCode.
+// Upstream only fills those for the ACP backend, never for codex, so the app
+// falls back to its built-in GPT list and custom models stay invisible.
+// codex app-server exposes `model/list` (it returns exactly what
+// ~/.codex/custom-model-catalog.json declares) and happy already negotiates
+// experimentalApi, so we can just ask and forward.
+// Set HAPPY_CODEX_MODEL_META=0 to disable.
+async function syncCodexModelMetadata(opts) {
+  if (process.env.HAPPY_CODEX_MODEL_META === "0") return;
+  const { client, session, currentModel } = opts;
+  if (!client || !session) return;
+  if (globalThis.__codexModelMetaBusy) return;
+  globalThis.__codexModelMetaBusy = true;
+  try {
+    let models = globalThis.__codexModelCatalog;
+    if (!models) {
+      const res = await client.request("model/list", {}, 15000);
+      const rows = (res && res.data) || [];
+      models = rows.filter((m) => m && !m.hidden && (m.id || m.model)).map((m) => ({
+        code: String(m.id || m.model),
+        value: String(m.displayName || m.name || m.id || m.model),
+        ...m.description != null ? { description: String(m.description) } : {}
+      }));
+      if (models.length > 0) globalThis.__codexModelCatalog = models;
+    }
+    if (!models || models.length === 0) return;
+    const known = currentModel && models.some((m) => m.code === currentModel);
+    session.updateMetadata((md) => ({
+      ...md,
+      models,
+      ...known ? { currentModelCode: currentModel } : {}
+    }));
+    logger.debug(`[CODEX MODEL META] reported ${models.length} models, current=${known ? currentModel : "unreported"}`);
+  } catch (error) {
+    logger.debug("[CODEX MODEL META] failed, leaving phone defaults alone:", error);
+  } finally {
+    globalThis.__codexModelMetaBusy = false;
+  }
+}
+'''
+# 建连后报清单：此时还没有线程，所以不带 currentModelCode
+P3_ANCHOR_CONNECT = "    await client.connect();"
+P3_BODY_CONNECT = (
+    "    await client.connect();\n"
+    "    // PATCH(local): without this the phone only ever shows the app's\n"
+    "    // built-in GPT list, because nothing reports our catalog to it.\n"
+    "    await syncCodexModelMetadata({ client, session });"
+)
+# resume 既有线程：上游拿到了 resumedThread.model 却丢掉，这里接住它
+P3_ANCHOR_RESUME = (
+    "    opts.session.updateMetadata((currentMetadata) => ({\n"
+    "      ...currentMetadata,\n"
+    "      codexThreadId: resumedThread.threadId\n"
+    "    }));"
+)
+P3_BODY_RESUME = P3_ANCHOR_RESUME + """
+    // PATCH(local): resumeThread hands back the thread's real model;
+    // upstream drops it, so the phone never learns which one is active.
+    await syncCodexModelMetadata({
+      client: opts.client,
+      session: opts.session,
+      currentModel: resumedThread.model
+    });"""
+# 新开会话：让「当前模型」角标跟着真实值走
+P3_ANCHOR_START = (
+    "          session.updateMetadata((currentMetadata) => ({\n"
+    "            ...currentMetadata,\n"
+    "            codexThreadId: startedThread.threadId\n"
+    "          }));"
+)
+P3_BODY_START = P3_ANCHOR_START + """
+          // PATCH(local): keep the phone's current-model badge truthful.
+          await syncCodexModelMetadata({
+            client,
+            session,
+            currentModel: startedThread.model ?? message.mode.model
+          });"""
+
 PATCHES = [
     {
         "id": "resume-backfill",
@@ -116,6 +213,17 @@ PATCHES = [
         "marker": "[CODEX CONFIG DEFAULTS]",
         "steps": [(P2_ANCHOR, P2_BODY), (P2_ANCHOR2, P2_BODY2)],
         "desc": "默认模型取自 config.toml，不再硬编码 gpt-5.6-sol",
+    },
+    {
+        "id": "model-catalog-to-phone",
+        "marker": "[CODEX MODEL META]",
+        "steps": [
+            (P3_ANCHOR_FUNC, P3_FUNC + P3_ANCHOR_FUNC),
+            (P3_ANCHOR_CONNECT, P3_BODY_CONNECT),
+            (P3_ANCHOR_RESUME, P3_BODY_RESUME),
+            (P3_ANCHOR_START, P3_BODY_START),
+        ],
+        "desc": "把 model/list 的真实模型清单与当前模型报给手机端",
     },
 ]
 

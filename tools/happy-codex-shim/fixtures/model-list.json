@@ -1,0 +1,71 @@
+{
+ "capturedAt": "2026-09-14T05:16:04.189Z",
+ "source": "codex app-server model/list (cli 0.152.1, custom-model-catalog.json)",
+ "result": {
+  "data": [
+   {
+    "id": "qwen3.8-max",
+    "model": "qwen3.8-max",
+    "displayName": "Qwen3.8-Max (ideaLAB)",
+    "description": "ideaLAB",
+    "hidden": false
+   },
+   {
+    "id": "bailian/glm-5.2",
+    "model": "bailian/glm-5.2",
+    "displayName": "GLM-5.2 (ideaLAB)",
+    "description": "ideaLAB",
+    "hidden": false
+   },
+   {
+    "id": "moonshot/kimi-k3",
+    "model": "moonshot/kimi-k3",
+    "displayName": "Kimi-K3 (ideaLAB)",
+    "description": "ideaLAB",
+    "hidden": false
+   },
+   {
+    "id": "MiniMax-M3",
+    "model": "MiniMax-M3",
+    "displayName": "MiniMax-M3",
+    "description": "MiniMax",
+    "hidden": false
+   },
+   {
+    "id": "gpt-5.5",
+    "model": "gpt-5.5",
+    "displayName": "GPT-5.5",
+    "description": "Frontier model for complex coding, research, and real-world work.",
+    "hidden": false
+   },
+   {
+    "id": "gpt-5.4",
+    "model": "gpt-5.4",
+    "displayName": "gpt-5.4",
+    "description": "Strong model for everyday coding.",
+    "hidden": false
+   },
+   {
+    "id": "gpt-5.4-mini",
+    "model": "gpt-5.4-mini",
+    "displayName": "GPT-5.4-Mini",
+    "description": "Small, fast, and cost-efficient model for simpler coding tasks.",
+    "hidden": false
+   },
+   {
+    "id": "gpt-5.3-codex",
+    "model": "gpt-5.3-codex",
+    "displayName": "gpt-5.3-codex",
+    "description": "Coding-optimized model.",
+    "hidden": false
+   },
+   {
+    "id": "gpt-5.2",
+    "model": "gpt-5.2",
+    "displayName": "gpt-5.2",
+    "description": "Optimized for professional work and long-running agents.",
+    "hidden": false
+   }
+  ]
+ }
+}
