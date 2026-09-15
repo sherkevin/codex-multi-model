@@ -12,4 +12,11 @@
 | [0005](0005-context-window-and-compaction-trigger.md) | 上下文窗口与压缩触发点必须等于上游真实上限 | Accepted |
 | [0006](0006-deferred-tool-bridge.md) | 延迟工具桥接：translate 模式必须还原 Codex 的全部原生工具形态 | Accepted |
 | [0007](0007-cross-platform-by-default.md) | 跨平台是默认要求，平台特性必须可选且可降级 | Accepted |
+| [0008](0008-mirror-mode-for-live-session-takeover.md) | 接管运行中会话走「镜像模式」：只读 rollout 监控 + 官方队列注入 | Accepted |
 | [0009](0009-upstream-byte-limit-is-escaped-and-undersold.md) | 上游字节硬顶按「ASCII 转义后」计量，且宣称值不可信（实测 4.5MiB，非 6291456） | Accepted |
+| [0010](0010-mirror-daemon-auto-discovery.md) | 镜像守护进程把「探知」变成自动的：只镜像持锁线程，每个镜像必须自证 MIRROR ON | Accepted |
+| [0011](0011-native-phone-pairing-blocked-by-three-walls.md) | 原生手机配对被三道墙挡住：OAuth 地域 403、控制面不可达、地址硬编码不可改向 | Accepted |
+| [0012](0012-happy-pairing-identity-must-match.md) | 手机 Happy 账号必须与本机 CLI 账号同一个；重新配对会让运行中的镜像失效 | Accepted |
+| [0013](0013-phone-model-list-must-come-from-catalog.md) | 手机的模型清单必须来自 `model/list`；镜像模式换模型够不着官方 RPC，只能如实告知 | Accepted |
+| [0014](0014-cursor-byok-via-codex-router.md) | Cursor 助手经 Codex router 接模型：绕过失效的系统代理，且配置与 Codex 同源 | Accepted |
+| [0015](0015-factory-state-is-canonical-and-auth-is-deleted.md) | 出厂态是「规范态、每次现推」，且登录态靠删文件而非清空 | Accepted |
