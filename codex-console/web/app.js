@@ -144,14 +144,16 @@ window.ccSetKey = async (k, btn) => {
   loadSecrets([k]);
 };
 
-// ── 运行模式（自定义 ↔ 原生）──
+// ── 运行模式（自定义 ↔ 原生 ↔ 出厂）──
 let MODE = { mode: "custom" };
 let MODE_TARGET = null;
+
+const MODE_LABEL = { custom: "自定义 中转", native: "原生 ChatGPT", factory: "出厂 未登录" };
 
 async function loadMode() {
   let m; try { m = await jget("/api/mode"); } catch (e) { return; }
   MODE = m; MODE_TARGET = m.mode;
-  $("#stMode").textContent = m.mode === "native" ? "原生 ChatGPT" : "自定义 中转";
+  $("#stMode").textContent = MODE_LABEL[m.mode] || m.mode;
   $$("#modeSeg .seg-btn").forEach(b => b.classList.toggle("active", b.dataset.mode === m.mode));
   const info = $("#modeInfo");
   const np = m.native_profile || {};
@@ -160,16 +162,84 @@ async function loadMode() {
       + `<br>切到「原生」<b>完全割裂</b>：还原 ChatGPT 登录`
       + (m.has_oauth_backup ? `（<code>${esc(m.oauth_backup)}</code>）` : `（⚠ 无登录备份，需 <code>codex login</code>）`)
       + `，model→<code>${esc(np.model || "?")}</code>、effort→<code>${esc(np.model_reasoning_effort || "默认")}</code>，并<b>删除</b> model_provider / 自定义模型目录 / review_model / model_providers 表。`
-      + `共享设置（hooks / mcp_servers / plugins / features）两态都不动，不会 drift。`;
-  } else {
+      + `共享设置（hooks / mcp_servers / plugins / features）三态都不动，不会 drift。`;
+  } else if (m.mode === "native") {
     info.innerHTML = `当前 <b>原生</b> · model=<code>${esc(m.model || "?")}</code> · ChatGPT 登录${m.has_oauth_tokens ? "（OAuth）" : ""} · 无中转、无自定义模型目录。`
-      + `<br>切到「自定义」会精确还原中转 + 第三方模型 + 自定义目录 + apikey 免登录。`;
+      + `<br>切到「自定义」会精确还原中转 + 第三方模型 + 自定义目录 + apikey 免登录；`
+      + `切到「出厂」会连登录态一起清掉（未登录的官方 Codex）。`;
+  } else {
+    // factory：已经是干净的未登录态
+    const leftovers = (m.factory_residual_keys || []);
+    info.innerHTML = `当前 <b>出厂</b> · 未登录（auth.json 已删除${m.keychain_auth_present ? "，⚠ Keychain 里仍有凭据" : ""}） · config.toml 无中转专属键，Codex 用它自己的内置默认。`
+      + `<br>这份配置等价于「刚装好、还没登录」的官方 Codex，可以直接交给 Cockpit Tools 等第三方切号器接管。`
+      + `<br>点 <b>Apply</b> 即可一键回到我们的中转配置（含 model / provider / 模型目录 / review / apikey 免登录，逐字节还原）。`
+      + (m.has_oauth_backup || m.has_keychain_backup
+          ? `<br>切「原生」可还原你之前的 ChatGPT 登录（<code>${esc(m.oauth_backup || "")}</code>${m.has_keychain_backup ? " + Keychain 备份" : ""}）。`
+          : `<br>⚠ 没有找到 ChatGPT 登录备份，切「原生」后需要重新 <code>codex login</code>。`)
+      + (leftovers.length
+          ? `<br><b style="color:var(--warn)">⚠ 检测到残留键：${leftovers.map(esc).join("、")}——可能是别的工具改过 config.toml。再点一次 Restore 清掉。</b>`
+          : "");
+  }
+  renderQuick(m);
+}
+
+// Restore / Apply 两个大按钮的状态提示
+function renderQuick(m) {
+  const hint = $("#quickHint");
+  if (!hint) return;
+  if (m.mode === "factory") {
+    hint.innerHTML = `当前已在<b>出厂</b>态。点 <b>Apply</b> 启用中转；Restore 无需再点。`;
+  } else {
+    hint.innerHTML = `点 <b>Restore</b> 立即恢复到未登录的官方 Codex（备份现有登录态，可一键还原）；`
+      + `点 <b>Apply</b> 立即启用我们这套中转配置。两者都会重启桌面 App 才生效。`;
   }
 }
 
 function selectMode(target) {
   MODE_TARGET = target;
   $$("#modeSeg .seg-btn").forEach(b => b.classList.toggle("active", b.dataset.mode === target));
+}
+
+// Restore / Apply：与上面的分段控件走同一个后端接口，只是把两步合成一步。
+// 为什么要单列这两个按钮：用户用 Cockpit Tools 时的固定动作就是「先 Restore 交给它，
+// 用完再 Apply 拿回来」，不该让他先在分段控件里选、再点确认、再点重启。
+async function quickSwitch(target, btn) {
+  if (MODE.mode === target && !(target === "factory" && (MODE.factory_residual_keys || []).length)) {
+    flash($("#quickMsg"), target === "factory" ? "已经是出厂态了" : "已经启用中转了");
+    return;
+  }
+  const warn = target === "factory"
+    ? "Restore 会把 Codex 恢复成「未登录的官方配置」：\n\n"
+      + "· 删除中转专属键（model / model_provider / review_model / 模型目录 / 思考档 / provider 表）\n"
+      + "· 删除 auth.json，并清掉 macOS Keychain 里的 Codex 凭据\n"
+      + "· 你现有的 ChatGPT 登录会先备份，之后点「原生」或 Apply 都能还原\n"
+      + "· 你的 hooks / mcp_servers / plugins / features 等共享设置一律不动\n\n"
+      + "需要重启桌面 App 生效，在途会话会中断。继续？"
+    : "Apply 会启用我们这套中转配置：\n\n"
+      + "· 还原 model / model_provider / 模型目录 / review / 思考档（逐字节还原，含注释）\n"
+      + "· auth.json 写成 apikey 免登录\n"
+      + "· 你的共享设置一律不动\n\n"
+      + "需要重启桌面 App 生效，在途会话会中断。继续？";
+  if (!confirm(warn)) return;
+  if (btn) btn.disabled = true;
+  flash($("#quickMsg"), target === "factory" ? "恢复出厂中…" : "启用中转中…");
+  try {
+    const r = await jpost("/api/mode", { target });
+    flash($("#quickMsg"), r.detail || ("已切到 " + r.mode), !r.ok);
+    await refreshAll();
+    const want = target === "factory"
+      ? "已恢复出厂。现在重启 Codex 桌面 App 让「未登录」生效？"
+      : "已启用中转。现在重启 Codex 桌面 App 让它生效？";
+    if (confirm(want)) {
+      await jpost("/api/restart", { target: "desktop" });
+      flash($("#quickMsg"), "已重启桌面 App，稍候刷新");
+      setTimeout(refreshAll, 4000);
+    }
+  } catch (e) {
+    flash($("#quickMsg"), (target === "factory" ? "Restore 失败 " : "Apply 失败 ") + e.message, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 // ── 动作 ──
@@ -180,8 +250,14 @@ function bind() {
   $$("#modeSeg .seg-btn").forEach(b => b.onclick = () => selectMode(b.dataset.mode));
   $("#applyMode").onclick = async () => {
     const target = MODE_TARGET;
-    if (!target || target === MODE.mode) { flash($("#modeMsg"), "已经在该模式，无需切换"); return; }
-    const warn = target === "native"
+    // factory 下若还有残留键（别的工具改过 config.toml），允许再切一次把它清掉。
+    const stuck = target === "factory" && (MODE.factory_residual_keys || []).length;
+    if (!target || (target === MODE.mode && !stuck)) {
+      flash($("#modeMsg"), "已经在该模式，无需切换"); return;
+    }
+    const warn = target === "factory"
+      ? "切到「出厂」：删除全部中转专属键 + 删除 auth.json + 清 Keychain 凭据，变成未登录的官方 Codex。现有登录会先备份。需重启桌面 App 生效。继续？"
+      : target === "native"
       ? "切到「原生」：还原 ChatGPT 登录、model/provider 退回原生、停用中转。需重启桌面 App 生效。继续？"
       : "切到「自定义」：恢复中转 + 第三方模型 + apikey 免登录。需重启桌面 App 生效。继续？";
     if (!confirm(warn)) return;
@@ -199,6 +275,8 @@ function bind() {
     } catch (e) { flash($("#modeMsg"), "切换失败 " + e.message, true); }
     finally { $("#applyMode").disabled = false; }
   };
+  $("#btnRestore").onclick = (e) => quickSwitch("factory", e.currentTarget);
+  $("#btnApply").onclick = (e) => quickSwitch("custom", e.currentTarget);
   $("#addProvider").onclick = () => {
     const n = prompt("provider 名字（如 openai / my-gateway）："); if (!n) return;
     STATE.providers[n] = { base: "", key_env: "" }; renderProviders();

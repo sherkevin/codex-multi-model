@@ -92,6 +92,9 @@ main{max-width:1000px;margin:18px auto;padding:0 20px;display:flex;flex-directio
 .mode-cur{font-size:12.5px;color:var(--fg)}
 .mode-cur b{font-family:var(--mono);color:var(--acc)}
 table.routes{width:100%;border-collapse:collapse;margin:12px 0;font-size:12.5px}
+/* 窄屏下路由表比卡片宽：让表在卡片内横向滚动，而不是把整页撑出横向滚动条 */
+.tbl-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+@media(max-width:760px){.tbl-scroll table.routes{min-width:560px}}
 table.routes th{text-align:left;color:var(--mut);font-weight:500;border-bottom:1px solid var(--line);padding:6px 8px;font-size:11.5px}
 table.routes td{border-bottom:1px solid var(--line);padding:7px 8px;vertical-align:middle}
 table.routes tr.pfx td{color:var(--mut)}
@@ -112,3 +115,9 @@ table.routes tr.pfx td{color:var(--mut)}
 .mode-info{margin-top:10px;font-size:12.5px;color:var(--mut);line-height:1.6}
 .mode-info code{font-family:var(--mono);color:var(--fg);background:var(--bg);padding:1px 5px;border-radius:5px}
 
+/* Restore / Apply 一键切换行：两个主动作，视觉上要与下面的分段控件分开 */
+.quick-row{gap:12px;padding:12px 0 4px;margin-top:8px;border-top:1px dashed var(--line)}
+.quick-row .btn{padding:10px 18px;font-size:13.5px;font-weight:600}
+.quick-row .btn.danger{background:transparent;color:var(--danger);border-color:var(--danger)}
+.quick-row .btn.danger:hover{background:rgba(248,81,73,.12);filter:none}
+#quickHint{margin:2px 0 12px}

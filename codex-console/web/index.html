@@ -30,16 +30,23 @@
 <main>
   <!-- ⓪ 运行模式：自定义 ↔ 原生 -->
   <details class="card" open>
-    <summary>⓪ 运行模式：自定义（中转）↔ 原生（ChatGPT 登录）</summary>
-    <p class="hint"><b>自定义</b>=走我们的中转 + 第三方模型 + 免登录绕过；<b>原生</b>=还原 ChatGPT 账号登录、model/provider 退回原生，一切复原。切换只动 <code>model</code>/<code>model_provider</code>/<code>review_model</code> + <code>auth.json</code>，其余配置原样保留；改前自动备份、可来回切。切完需重启桌面 App 生效。</p>
+    <summary>⓪ 运行模式：自定义（中转）↔ 原生（ChatGPT 登录）↔ 出厂（未登录）</summary>
+    <p class="hint"><b>自定义</b>=走我们的中转 + 第三方模型 + 免登录绕过；<b>原生</b>=还原 ChatGPT 账号登录、model/provider 退回原生；<b>出厂</b>=把配置交还给「刚装好、还没登录」的官方 Codex，给第三方切号器（如 Cockpit Tools）接管用。切换只动模式专属键（<code>model</code> / <code>model_provider</code> / <code>review_model</code> / <code>model_catalog_json</code> / <code>model_reasoning_effort</code> / <code>model_providers</code>）+ <code>auth.json</code>，你的 <code>hooks</code> / <code>mcp_servers</code> / <code>plugins</code> / <code>features</code> 等共享设置三态都不碰；改前自动备份、可来回切，且往返逐字节不变。切完需重启桌面 App 生效。</p>
     <div class="row mode-row">
       <div class="seg" id="modeSeg">
         <button type="button" data-mode="custom" class="seg-btn">自定义（中转）</button>
         <button type="button" data-mode="native" class="seg-btn">原生（ChatGPT 登录）</button>
+        <button type="button" data-mode="factory" class="seg-btn">出厂（未登录）</button>
       </div>
       <button id="applyMode" class="btn primary">切换到所选模式</button>
       <span id="modeMsg" class="msg"></span>
     </div>
+    <div class="row quick-row">
+      <button id="btnRestore" class="btn danger" title="一键恢复到未登录的官方 Codex，配置交给第三方切号器接管">Restore（恢复出厂 · 未登录）</button>
+      <button id="btnApply" class="btn primary" title="一键套用我们这套中转配置（多模型 + 免登录）">Apply（启用中转）</button>
+      <span id="quickMsg" class="msg"></span>
+    </div>
+    <p class="hint" id="quickHint"></p>
     <div id="modeInfo" class="mode-info"></div>
   </details>
 
@@ -48,7 +55,7 @@
     <summary>后端模式 & 中转（model → 真实 provider，透明路由）</summary>
     <div id="backendBox" class="backend-box"></div>
     <p class="hint">下表是中转 <b>此刻真实生效</b> 的路由（取自 <code>/v1/routes</code>）。Codex 的 <code>model_provider</code> 是单值：跨 provider 或含 translate 模型时必须经中转统一分发；只有「全部模型同一 provider 且都 passthrough」才能直连、不经中转。</p>
-    <table class="routes" id="routesTable"></table>
+    <div class="tbl-scroll"><table class="routes" id="routesTable"></table></div>
     <div class="row">
       <button id="applyBackend" class="btn">应用推荐后端到 config.toml</button>
       <button id="restartRouter" class="btn">⟳ 重启中转</button>

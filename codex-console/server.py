@@ -218,8 +218,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_mode(self):
         target = (self._read_json().get("target") or "").strip()
-        if target not in ("custom", "native"):
-            self._send(400, {"error": "target 必须是 custom 或 native"})
+        if target not in ("custom", "native", "factory"):
+            self._send(400, {"error": "target 必须是 custom、native 或 factory"})
             return
         res = config_io.set_run_mode(target)
         self._send(200 if res.get("ok") else 500, res)

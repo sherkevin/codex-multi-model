@@ -28,15 +28,25 @@ Codex 多模型的**本地可视化配置台**。在浏览器里配好 API / AK 
 
 ---
 
-## 四个核心能力
+## 五个核心能力
 
 **① 配 API 和 AK** — 可视化增删改 provider（base_url / wire_api / env_key），AK 单独写入 `router-secrets.env`，界面只显示掩码（如 `677••••••64e9`），**绝不回显明文、绝不写进 config.toml**。改 config.toml 用 `tomlkit`，**逐字符保留你手写的注释**，每次写入前自动备份 `*.bak-<时间戳>`。
 
 **② 绕过账号登录** — Codex 登录门只校验 `auth.json` 处于 `apikey` 模式且有任意非空 key；用一个占位串即可过门，真实模型鉴权由中转各自的 AK 完成，与这个占位 key 无关。「修复登录绕过」按钮在 `codex logout` 或升级把它重置后一键恢复。
 
-**③ 一键重启 Codex（仅 macOS）** — 主按钮重启 **Codex 桌面 App**（`/Applications/ChatGPT.app`，即 `killall ChatGPT` + `open`），让模型目录等改动立即生效；**会关闭当前在途会话**，故带二次确认。另有「重启中转」按钮，供改 AK / 路由后生效（`launchctl kickstart`，label 自动探测）。这两个按钮依赖 `launchctl` / `killall` / `open`，只在 macOS 有效；Linux / Windows 上点它们会返回一段「该怎么手动重启」的说明，不会抛异常——配置本身已经写好了，重启只是让它生效。
+**③ Restore / Apply 一键换档** — 三态互切，只动「模式专属键」（`model` / `model_provider` / `review_model` / `model_catalog_json` / `model_reasoning_effort` / `model_providers`）+ `auth.json`，你的 `hooks` / `mcp_servers` / `plugins` / `features` 等共享设置三态都不碰：
 
-**④ 在 Codex 里用** — 配置写完、重启完，回到 Codex 桌面 App 或 CLI，`/model` 里就是你配的模型，照常工作。本工具到此功成身退。
+- **自定义（中转）**：走我们的中转 + 第三方模型 + apikey 免登录。
+- **原生（ChatGPT 登录）**：还原真实 OAuth 登录、model/思考档退回原生、删掉中转专属键。
+- **出厂（未登录）**：**Restore** 按钮把 Codex 恢复成「刚装好、还没登录」的官方状态——删 auth.json 文件（不是清空，实测清空仍报已登录）、清 macOS Keychain 凭据、删全部中转专属键（连注释一起）。这份配置可以直接交给 Cockpit Tools 等第三方切号器接管。
+
+**Apply** 按钮一键拿回中转配置，`config.toml` 逐字节还原（含你手写的注释与键序）。登录态在 Restore 前自动备份（`auth.json.bak-chatgpt-*` / `.console-keychain-auth.bak`），切回原生或 Apply 时自动还原，不用重新扫码。出厂态是规范态、每次现推（见 [ADR 0015](../docs/adr/0015-factory-state-is-canonical-and-auth-is-deleted.md)）。
+
+**④ 一键重启 Codex（仅 macOS）** — 主按钮重启 **Codex 桌面 App**（`/Applications/ChatGPT.app`，即 `killall ChatGPT` + `open`），让模型目录等改动立即生效；**会关闭当前在途会话**，故带二次确认。另有「重启中转」按钮，供改 AK / 路由后生效（`launchctl kickstart`，label 自动探测）。这两个按钮依赖 `launchctl` / `killall` / `open`，只在 macOS 有效；Linux / Windows 上点它们会返回一段「该怎么手动重启」的说明，不会抛异常——配置本身已经写好了，重启只是让它生效。
+
+**⑤ 在 Codex 里用** — 配置写完、重启完，回到 Codex 桌面 App 或 CLI，`/model` 里就是你配的模型，照常工作。本工具到此功成身退。
+
+**⑥ 回归测试兜底** — `python3 ../tests/test_run_mode_switch.py` 覆盖三态往返、逐字节还原、残留键清理，并用**真实 `codex` 二进制**校验「出厂态确实 Not logged in、配置确实能加载」。改这块逻辑前先跑它。
 
 ---
 
@@ -126,7 +136,7 @@ source ~/.codex/router-secrets.env 2>/dev/null;
 | `web/` | 单页前端（`index.html`/`app.js`/`styles.css`），零依赖零构建 |
 | `run.sh` / `install-service.sh` | 前台启动 / 装常驻服务 |
 
-API：`GET /api/status`（一致性面板）`GET /api/models` `GET|POST /api/routes`（model→真实 provider 路由表，读时取自中转 `/v1/routes`）`GET|POST /api/config` `GET|POST /api/catalog` `POST /api/secrets` `POST /api/auth`（修复登录绕过）`POST /api/restart`（target=desktop|router）。
+API：`GET /api/status`（一致性面板）`GET /api/models` `GET|POST /api/routes`（model→真实 provider 路由表，读时取自中转 `/v1/routes`）`GET|POST /api/config` `GET|POST /api/catalog` `POST /api/secrets` `POST /api/auth`（修复登录绕过）`GET|POST /api/mode`（target=custom|native|factory，即 Restore/Apply）`POST /api/restart`（target=desktop|router）。
 
 ## 许可
 
