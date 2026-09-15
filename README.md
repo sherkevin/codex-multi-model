@@ -171,6 +171,26 @@ The console runs on all three platforms. Config reads and writes work everywhere
 two **restart buttons are macOS-only** (they shell out to `launchctl` / `killall`). On
 other platforms they return explicit instructions instead of failing silently.
 
+**Restore / Apply — one-click mode switching.** The console also switches between three
+modes, touching only the mode-specific keys (`model`, `model_provider`, `review_model`,
+`model_catalog_json`, `model_reasoning_effort`, `model_providers`) plus `auth.json`; your
+`hooks` / `mcp_servers` / `plugins` / `features` are never touched:
+
+- **Custom (proxy)** — our proxy + third-party models + apikey login bypass.
+- **Native (ChatGPT)** — restore the real OAuth login, revert model/effort, drop proxy keys.
+- **Factory (logged out)** — **Restore** returns Codex to a pristine "just installed, never
+  logged in" state: deletes `auth.json` (not empties it — Codex only treats a *missing* file
+  as logged out), clears the macOS Keychain credential, and strips every proxy key *together
+  with its comments*. Hand this config to a third-party account switcher (e.g. Cockpit Tools)
+  and it sees a clean slate.
+
+**Apply** brings the proxy config back byte-for-byte (your handwritten comments and key order
+included). Logins are backed up before Restore (`auth.json.bak-chatgpt-*`,
+`.console-keychain-auth.bak`) and restored automatically on the way back — no re-scan needed.
+See [ADR 0015](docs/adr/0015-factory-state-is-canonical-and-auth-is-deleted.md) and
+`python3 tests/test_run_mode_switch.py` (which verifies the factory state against the real
+`codex` binary).
+
 ---
 
 ## Provider / model routing is transparent and editable

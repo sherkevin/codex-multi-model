@@ -161,6 +161,25 @@ python server.py      # 任意系统（需要 tomlkit）
 配置台三个平台都能跑。配置读写全平台可用；两个**重启按钮仅 macOS**（内部调
 `launchctl` / `killall`），其它平台会返回明确的操作指引而不是静默失败。
 
+**Restore / Apply 一键换档。** 配置台还支持三态互切，只动「模式专属键」
+（`model` / `model_provider` / `review_model` / `model_catalog_json` /
+`model_reasoning_effort` / `model_providers`）+ `auth.json`，你的 `hooks` /
+`mcp_servers` / `plugins` / `features` 三态都不碰：
+
+- **自定义（中转）**：走我们的中转 + 第三方模型 + apikey 免登录。
+- **原生（ChatGPT）**：还原真实 OAuth 登录、model/思考档退回原生、删掉中转专属键。
+- **出厂（未登录）**：**Restore** 把 Codex 恢复成「刚装好、还没登录」的官方状态——
+  删 `auth.json` 文件（不是清空：实测清空仍报已登录，Codex 只认文件在不在）、清
+  macOS Keychain 凭据、删全部中转专属键（连注释一起）。这份配置可以直接交给
+  Cockpit Tools 等第三方切号器接管，它看到的是一份干净配置。
+
+**Apply** 一键拿回中转配置，`config.toml` 逐字节还原（含你手写的注释与键序）。
+登录态在 Restore 前自动备份（`auth.json.bak-chatgpt-*` / `.console-keychain-auth.bak`），
+切回时自动还原，不用重新扫码。详见
+[ADR 0015](docs/adr/0015-factory-state-is-canonical-and-auth-is-deleted.md) 与
+`python3 tests/test_run_mode_switch.py`（该测试用**真实 codex 二进制**校验出厂态
+确实未登录、配置确实能加载）。
+
 ---
 
 ## 路由透明、可编辑
